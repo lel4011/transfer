@@ -1,0 +1,3555 @@
+---
+title: "simulation-entanglement"
+author: "Lejing Li"
+date: "2025-11-27"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r}
+devtools::load_all()
+```
+# package
+```{r}
+library(sccomp)
+packageVersion("sccomp")
+```
+
+```{r}
+library(magrittr)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(patchwork)
+library(ggplot2)
+library(ggrepel)
+library(posterior)
+library(purrr)
+library(stringr)
+library(readr)
+library(phyloseq)
+library(ggplot2)
+library(patchwork)
+library(vegan)
+library(tidyverse)
+library(compositions)
+```
+
+# helper function
+## sccomp data input
+
+```{r}
+# Helper function to prepare data for sccomp
+prepare_sccomp_data <- function(counts_matrix, group_vector) {
+  sccomp_data <- counts_matrix %>%
+    as.data.frame() %>%
+    rownames_to_column("sample") %>%
+    pivot_longer(
+      cols = -sample,
+      names_to = "cell_group",
+      values_to = "count"
+    ) %>%
+    mutate(
+      group = rep(group_vector, each = ncol(counts_matrix)),
+      count = as.integer(count)
+    )
+  return(sccomp_data)
+}
+```
+
+## FPR for betadisper
+```{r}
+run_100_sims <- function(sim_func, scenario_name, ...) {
+  results <- data.frame(
+    scenario = character(),
+    distance = character(),
+    p_value = numeric()
+  )
+  
+  for (i in 1:100) {
+    sim <- sim_func(seed = i, ...)
+    relab <- sweep(sim$counts, 1, rowSums(sim$counts), "/")
+    
+    # Bray-Curtis
+    dist_bc <- vegdist(relab, method = "bray")
+    bd_bc <- betadisper(dist_bc, sim$group)
+    perm_bc <- permutest(bd_bc, permutations = 999)
+    
+    # Aitchison
+    counts_pseudo <- sim$counts + 0.5
+    relab_pseudo <- sweep(counts_pseudo, 1, rowSums(counts_pseudo), "/")
+    clr_data <- t(apply(relab_pseudo, 1, function(x) {
+      log_x <- log(x)
+      log_x - mean(log_x)
+    }))
+    dist_ait <- dist(clr_data)
+    bd_ait <- betadisper(dist_ait, sim$group)
+    perm_ait <- permutest(bd_ait, permutations = 999)
+    
+    results <- rbind(results, data.frame(
+      scenario = scenario_name,
+      distance = c("bray", "aitchison"),
+      p_value = c(perm_bc$tab$`Pr(>F)`[1], perm_ait$tab$`Pr(>F)`[1])
+    ))
+  }
+  
+  return(results)
+}
+```
+
+```{r}
+calculate_fpr <- function(results, alpha = 0.05) {
+  summary_table <- results %>%
+    group_by(scenario, distance) %>%
+    summarise(
+      n_sims = n(),
+      n_rejected = sum(p_value < alpha),
+      fpr = mean(p_value < alpha),
+      mean_p = mean(p_value),
+      median_p = median(p_value),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      fpr_percent = sprintf("%.1f%%", fpr * 100),
+      ci_lower = qbinom(0.025, n_sims, fpr) / n_sims,
+      ci_upper = qbinom(0.975, n_sims, fpr) / n_sims,
+      ci_95 = sprintf("[%.3f, %.3f]", ci_lower, ci_upper)
+    )
+  
+  return(summary_table)
+}
+```
+
+
+## plot for betadisper
+```{r}
+create_betadisper_pcoa <- function(bd_object, group_vector, distance_name, scenario_name) {
+  
+  pcoa_coords <- as.data.frame(bd_object$vectors)
+  pcoa_coords$Group <- group_vector
+  pcoa_coords$Distance_to_centroid <- bd_object$distances
+  
+  centroids <- as.data.frame(bd_object$centroids)
+  centroids$Group <- rownames(centroids)
+  
+  eig <- bd_object$eig
+  var_exp <- eig / sum(eig) * 100
+  
+  p <- ggplot(pcoa_coords, aes(x = PCoA1, y = PCoA2, color = Group)) +
+    geom_point(alpha = 0.5, size = 2) +
+    geom_point(data = centroids, aes(x = PCoA1, y = PCoA2), 
+               size = 5, shape = 18) +
+    geom_segment(aes(xend = centroids$PCoA1[match(Group, centroids$Group)],
+                     yend = centroids$PCoA2[match(Group, centroids$Group)]),
+                 alpha = 0.3, size = 0.3) +
+    scale_color_manual(values = c("G1" = "#377EB8", "G2" = "#E41A1C")) +
+    labs(
+      title = paste0("Scenario ", scenario_name, ": ", distance_name),
+      x = sprintf("PCoA1 (%.1f%%)", var_exp[1]),
+      y = sprintf("PCoA2 (%.1f%%)", var_exp[2])
+    ) +
+    theme_bw(base_size = 10) +
+    theme(legend.position = "bottom", plot.title = element_text(size = 10, face = "bold"))
+  
+  return(p)
+}
+
+
+create_rejection_barplot <- function(summary_stats, scenario_name, ground_truth_label) {
+  summary_stats %>%
+    filter(scenario == scenario_name) %>%
+    ggplot(aes(x = distance, y = rejection_rate, fill = distance)) +
+    geom_col(width = 0.6) +
+    geom_hline(yintercept = 0.05, linetype = "dashed", color = "red", size = 0.8) +
+    geom_text(aes(label = sprintf("%.2f", rejection_rate)), 
+              vjust = -0.5, size = 3) +
+    scale_fill_manual(values = c("bray" = "#377EB8", "aitchison" = "#4DAF4A")) +
+    labs(title = "Rejection Rate (n=100)",
+         subtitle = ground_truth_label,
+         y = "Rate", x = "") +
+    ylim(0, 1) +
+    theme_bw(base_size = 10) +
+    theme(legend.position = "none")
+}
+```
+
+# dataset
+
+```{r}
+library(biomformat)
+
+biom_file <- "C:/Users/12927/OneDrive/Desktop/research/group-level-dv/dataset/taxonomic_profiles.biom"
+ps <- import_biom(biom_file)   
+
+meta_file <- "C:/Users/12927/OneDrive/Desktop/research/group-level-dv/dataset/hmp2_metadata.csv"
+meta <- read_csv(meta_file, show_col_types = FALSE)
+
+```
+
+```{r}
+otu_mat <- as(otu_table(ps), "matrix")
+if (!taxa_are_rows(ps)) otu_mat <- t(otu_mat)
+
+otu_df <- as.data.frame(otu_mat) |>
+  rownames_to_column("taxa") |>
+  pivot_longer(cols = -taxa, names_to = "sample", values_to = "count") |>
+  mutate(count = as.integer(round(count)))   
+
+otu_df <- otu_df |>
+  group_by(sample) |>
+  filter(sum(count) > 0) |>
+  ungroup()
+
+nonzero_taxa <- otu_df |>
+  group_by(taxa) |>
+  summarize(nz = sum(count > 0), .groups = "drop") |>
+  filter(nz > 0) |>
+  pull(taxa)
+
+otu_df <- otu_df |> filter(taxa %in% nonzero_taxa)
+
+tax_df <- as.data.frame(tax_table(ps))
+tax_df <- tax_df %>% 
+  rownames_to_column("taxa") %>%
+  mutate(Rank1 = as.character(Rank1))
+```
+
+
+
+## Genus-level
+
+```{r}
+extract_genus <- function(x) {
+  if (is.na(x) || x == "") return("Unclassified")
+  parts <- strsplit(x, ";", fixed = TRUE)[[1]]
+  parts <- trimws(parts)
+  cand <- if (length(parts) >= 6) parts[6] else NA_character_
+  return(cand)
+}
+
+tax_df <- tax_df %>%
+  mutate(Genus = vapply(Rank1, extract_genus, FUN.VALUE = character(1))) %>%
+  select(taxa, Genus)
+
+otu_genus <- otu_df %>%
+  left_join(tax_df, by = "taxa") %>%
+  mutate(Genus = if_else(is.na(Genus) | Genus == "", "Unclassified", Genus)) %>%
+  group_by(sample, Genus) %>%
+  summarise(count = sum(count), .groups = "drop")
+
+meta_norm <- meta %>%
+  mutate(sample = trimws(as.character(`External ID`))) %>%
+  filter(sample %in% sample_names(ps))
+
+sccomp_input_genus <- otu_genus %>%
+  left_join(meta_norm, by = "sample") %>%
+  rename(cell_group = Genus) %>%
+  mutate(count = as.integer(count)) %>%
+  relocate(sample, cell_group, count)
+
+sccomp_input_genus <- sccomp_input_genus %>%
+  mutate(cell_group = str_replace(cell_group, "^_+", ""))
+
+group_df <- sccomp_input_genus %>%
+  distinct(sample, diagnosis) %>%
+  mutate(group = ifelse(diagnosis %in% c("CD","UC"), "IBD", "Healthy")) %>%
+  mutate(group = factor(group, levels = c("Healthy","IBD")))  # intercept = Healthy 
+
+sccomp_input_genus <- sccomp_input_genus %>%
+  left_join(group_df %>% select(sample, group), by = "sample")
+```
+
+## otu
+
+```{r}
+otu_wide <- sccomp_input_genus %>%
+  select(sample, cell_group, count) %>%
+  pivot_wider(names_from = cell_group, values_from = count, values_fill = 0) %>%
+  as.data.frame()
+
+rownames(otu_wide) <- otu_wide$sample
+otu_wide <- otu_wide[ , -1]  
+```
+
+# check if association is diff
+```{r}
+library(tidyverse)
+
+# 1. 计算每个样本的proportions和variability
+sample_props <- sccomp_input_genus %>%
+  group_by(sample) %>%
+  mutate(
+    total = sum(count),
+    proportion = count / total
+  ) %>%
+  ungroup()
+
+# 2. 计算每个genus在每个组内的mean和variance
+genus_stats <- sample_props %>%
+  group_by(cell_group, group) %>%
+  summarise(
+    mean_prop = mean(proportion),
+    var_prop = var(proportion),
+    n_samples = n(),
+    .groups = "drop"
+  ) %>%
+  filter(n_samples >= 5) %>%  # 至少5个样本
+  mutate(
+    log_mean = log(mean_prop + 1e-6),
+    log_var = log(var_prop + 1e-10)
+  )
+
+# 3. 可视化：两组的mean-variance关系
+library(ggplot2)
+
+p1 <- ggplot(genus_stats, aes(x = log_mean, y = log_var, color = group)) +
+  geom_point(alpha = 0.6, size = 2) +
+  geom_smooth(method = "lm", se = TRUE, linewidth = 1.2) +
+  scale_color_manual(values = c("Healthy" = "#2E86AB", "IBD" = "#A23B72")) +
+  labs(
+    title = "Mean-Variance Association by Group",
+    subtitle = "Are the slopes (ω) different?",
+    x = "log(Mean Proportion)",
+    y = "log(Variance)",
+    color = "Group"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold")
+  )
+
+print(p1)
+
+# 4. 分别拟合线性模型，看斜率
+fit_healthy <- lm(log_var ~ log_mean, 
+                  data = genus_stats %>% filter(group == "Healthy"))
+fit_ibd <- lm(log_var ~ log_mean, 
+              data = genus_stats %>% filter(group == "IBD"))
+
+cat("=== Healthy Group ===\n")
+cat("Slope (ω₀):", coef(fit_healthy)[2], "\n")
+cat("Intercept:", coef(fit_healthy)[1], "\n\n")
+
+cat("=== IBD Group ===\n")
+cat("Slope (ω₀ + ωₓ):", coef(fit_ibd)[2], "\n")
+cat("Intercept:", coef(fit_ibd)[1], "\n\n")
+
+cat("=== Difference ===\n")
+cat("Slope difference (ωₓ):", coef(fit_ibd)[2] - coef(fit_healthy)[2], "\n\n")
+
+# 5. 统计检验：交互项是否显著
+fit_interaction <- lm(log_var ~ log_mean * group, data = genus_stats)
+cat("=== Interaction Test ===\n")
+print(summary(fit_interaction))
+
+# 6. 提取交互项的p值
+interaction_p <- summary(fit_interaction)$coefficients["log_mean:groupIBD", "Pr(>|t|)"]
+cat("\nInteraction p-value:", interaction_p, "\n")
+cat("Significant at α=0.05?", ifelse(interaction_p < 0.05, "YES", "NO"), "\n")
+
+# 7. 额外可视化：残差图
+genus_stats_pred <- genus_stats %>%
+  mutate(
+    pred_healthy = predict(fit_healthy, newdata = data.frame(log_mean = log_mean)),
+    pred_ibd = predict(fit_ibd, newdata = data.frame(log_mean = log_mean)),
+    residual = ifelse(group == "Healthy", 
+                      log_var - pred_healthy,
+                      log_var - pred_ibd)
+  )
+
+p2 <- ggplot(genus_stats_pred, aes(x = log_mean, y = residual, color = group)) +
+  geom_point(alpha = 0.6) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  scale_color_manual(values = c("Healthy" = "#2E86AB", "IBD" = "#A23B72")) +
+  labs(
+    title = "Residuals from Group-Specific Fits",
+    x = "log(Mean Proportion)",
+    y = "Residual"
+  ) +
+  theme_minimal(base_size = 12) +
+  facet_wrap(~group, ncol = 2)
+
+print(p2)
+
+# 8. 计算R²来看拟合质量
+r2_healthy <- summary(fit_healthy)$r.squared
+r2_ibd <- summary(fit_ibd)$r.squared
+
+cat("\n=== Model Fit Quality ===\n")
+cat("R² (Healthy):", round(r2_healthy, 3), "\n")
+cat("R² (IBD):", round(r2_ibd, 3), "\n")
+```
+
+# check another dataset
+
+# data 2
+
+```{r}
+metadata <- read_csv("dataset/microbiomeHD_meta_data.csv")
+load("C:/Users/12927/OneDrive/Desktop/research/differential-variability/dataset/OTU_crc_zackular.RData")
+
+```
+
+
+
+```{r}
+metadata <- metadata %>%
+  mutate(
+    sample = Sam_id,                      
+    DiseaseState = ifelse(DiseaseState == "nonCRC", "H", DiseaseState),
+    DiseaseState = factor(DiseaseState, levels = c("H","CRC"))
+  ) %>%
+  filter(!is.na(DiseaseState)) %>%
+  select(sample, everything())              
+
+OTU_tab_zackular <- t(as.data.frame(fit_crc_zackular))  
+
+
+data_long <- OTU_tab_zackular %>%
+  as.data.frame() %>%
+  rownames_to_column("taxa") %>%
+  pivot_longer(
+    cols = -taxa,
+    names_to = "sample",
+    values_to = "count"
+  )
+
+sccomp_input <- data_long %>%
+  left_join(metadata %>% distinct(sample, .keep_all = TRUE), by = "sample") %>%
+  mutate(
+    count = as.integer(round(count))
+  )
+
+names(sccomp_input)[names(sccomp_input) == "taxa"] <- "cell_group"
+
+```
+
+```{r}
+library(tidyverse)
+library(ggplot2)
+
+# 1. 数据概览
+cat("=== Data Overview ===\n")
+cat("Total samples:", n_distinct(sccomp_input$sample), "\n")
+cat("Total OTUs:", n_distinct(sccomp_input$cell_group), "\n")
+
+# 查看分组情况
+group_summary <- sccomp_input %>%
+  distinct(sample, DiseaseState) %>%
+  count(DiseaseState)
+print(group_summary)
+
+# 2. 计算proportions
+sample_props_crc <- sccomp_input %>%
+  group_by(sample) %>%
+  mutate(
+    total = sum(count),
+    proportion = count / total
+  ) %>%
+  ungroup()
+
+# 3. 计算每个OTU在每个组内的mean和variance
+otu_stats_crc <- sample_props_crc %>%
+  group_by(cell_group, DiseaseState) %>%
+  summarise(
+    mean_prop = mean(proportion),
+    var_prop = var(proportion),
+    n_samples = n(),
+    .groups = "drop"
+  ) %>%
+  filter(n_samples >= 5) %>%  # 至少5个样本
+  mutate(
+    log_mean = log(mean_prop + 1e-6),
+    log_var = log(var_prop + 1e-10)
+  ) %>%
+  filter(is.finite(log_mean) & is.finite(log_var))
+
+cat("\n=== OTUs with sufficient data ===\n")
+cat("OTUs analyzed:", n_distinct(otu_stats_crc$cell_group), "\n")
+
+# 4. 可视化：两组的mean-variance关系
+p1_crc <- ggplot(otu_stats_crc, aes(x = log_mean, y = log_var, color = DiseaseState)) +
+  geom_point(alpha = 0.6, size = 2) +
+  geom_smooth(method = "lm", se = TRUE, linewidth = 1.2) +
+  scale_color_manual(
+    values = c("H" = "#2E86AB", "CRC" = "#A23B72"),
+    labels = c("H" = "Healthy", "CRC" = "CRC")
+  ) +
+  labs(
+    title = "Mean-Variance Association: CRC Dataset",
+    subtitle = "Comparing slopes between Healthy and CRC",
+    x = "log(Mean Proportion)",
+    y = "log(Variance)",
+    color = "Group"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold")
+  )
+
+print(p1_crc)
+
+# 5. 分别拟合线性模型
+fit_healthy_crc <- lm(log_var ~ log_mean, 
+                      data = otu_stats_crc %>% filter(DiseaseState == "H"))
+fit_crc <- lm(log_var ~ log_mean, 
+              data = otu_stats_crc %>% filter(DiseaseState == "CRC"))
+
+cat("\n=== Healthy Group ===\n")
+cat("Slope (ω₀):", coef(fit_healthy_crc)[2], "\n")
+cat("Intercept:", coef(fit_healthy_crc)[1], "\n")
+cat("R²:", summary(fit_healthy_crc)$r.squared, "\n")
+
+cat("\n=== CRC Group ===\n")
+cat("Slope (ω₀ + ωₓ):", coef(fit_crc)[2], "\n")
+cat("Intercept:", coef(fit_crc)[1], "\n")
+cat("R²:", summary(fit_crc)$r.squared, "\n")
+
+cat("\n=== Difference ===\n")
+slope_diff <- coef(fit_crc)[2] - coef(fit_healthy_crc)[2]
+cat("Slope difference (ωₓ):", slope_diff, "\n")
+cat("Relative difference:", 
+    round(100 * slope_diff / coef(fit_healthy_crc)[2], 1), "%\n")
+
+# 6. 统计检验：交互项
+fit_interaction_crc <- lm(log_var ~ log_mean * DiseaseState, data = otu_stats_crc)
+
+cat("\n=== Interaction Test ===\n")
+interaction_summary <- summary(fit_interaction_crc)$coefficients
+print(interaction_summary)
+
+interaction_p_crc <- interaction_summary["log_mean:DiseaseStateCRC", "Pr(>|t|)"]
+cat("\nInteraction p-value:", interaction_p_crc, "\n")
+cat("Significant at α=0.05?", ifelse(interaction_p_crc < 0.05, "YES ✓", "NO ✗"), "\n")
+
+# 7. 对比两个数据集的可视化
+p2_crc <- ggplot(otu_stats_crc, aes(x = log_mean, y = log_var, color = DiseaseState)) +
+  geom_point(alpha = 0.4, size = 1.5) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 1.5) +
+  scale_color_manual(
+    values = c("H" = "#2E86AB", "CRC" = "#A23B72"),
+    labels = c("H" = "Healthy", "CRC" = "CRC")
+  ) +
+  labs(
+    title = "CRC Dataset: Mean-Variance Relationship",
+    x = "log(Mean Proportion)",
+    y = "log(Variance)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = c(0.15, 0.85))
+
+print(p2_crc)
+
+# 8. 残差分析
+otu_stats_crc <- otu_stats_crc %>%
+  mutate(
+    pred_healthy = predict(fit_healthy_crc, newdata = data.frame(log_mean = log_mean)),
+    pred_crc = predict(fit_crc, newdata = data.frame(log_mean = log_mean)),
+    residual = ifelse(DiseaseState == "H", 
+                      log_var - pred_healthy,
+                      log_var - pred_crc)
+  )
+
+p3_crc <- ggplot(otu_stats_crc, aes(x = log_mean, y = residual, color = DiseaseState)) +
+  geom_point(alpha = 0.6) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  scale_color_manual(
+    values = c("H" = "#2E86AB", "CRC" = "#A23B72"),
+    labels = c("H" = "Healthy", "CRC" = "CRC")
+  ) +
+  labs(
+    title = "Residuals from Group-Specific Fits",
+    x = "log(Mean Proportion)",
+    y = "Residual"
+  ) +
+  theme_minimal(base_size = 12) +
+  facet_wrap(~DiseaseState, ncol = 2, 
+             labeller = labeller(DiseaseState = c("H" = "Healthy", "CRC" = "CRC")))
+
+print(p3_crc)
+
+# 9. 总结
+cat("\n=== SUMMARY ===\n")
+cat("CRC Dataset:\n")
+cat("  - Slope difference (ωₓ):", round(slope_diff, 3), "\n")
+cat("  - Interaction p-value:", format(interaction_p_crc, scientific = TRUE), "\n")
+cat("  - Significant difference?", 
+    ifelse(interaction_p_crc < 0.05, "YES - angles differ", "NO - parallel lines"), "\n")
+```
+
+
+
+# parameter from real world data 
+
+## Number of samples for each group
+
+```{r}
+sccomp_input_genus %>%
+     distinct(sample, group) %>%
+     count(group)
+```
+
+
+## Number of taxa
+
+```{r}
+sccomp_input_genus %>%
+     distinct(cell_group) %>%
+     nrow()
+```
+
+
+## Effect size
+
+```{r}
+counts_matrix <- as.matrix(otu_wide)
+group_vector <- group_df$group[match(rownames(counts_matrix), group_df$sample)]
+
+# each group mean
+mean_healthy <- colMeans(counts_matrix[group_vector == "Healthy", ])
+mean_ibd <- colMeans(counts_matrix[group_vector == "IBD", ])
+
+# rare taxa
+keep <- mean_healthy > 1 & mean_ibd > 1
+mean_healthy <- mean_healthy[keep]
+mean_ibd <- mean_ibd[keep]
+
+# fold change
+fold_change <- mean_ibd / mean_healthy
+
+# standardize fold change
+fc_normalized <- ifelse(fold_change > 1, fold_change, 1/fold_change)
+
+# extreme taxa (FC > 5 or < 0.2)
+extreme_fc <- fc_normalized[fold_change > 5 | fold_change < 0.2]
+
+# effect_size
+if(length(extreme_fc) > 0) {
+  effect_size_extreme <- median(extreme_fc)
+} else {
+  effect_size_extreme <- NA
+}
+
+effect_size_all <- median(fc_normalized)
+
+effect_size_extreme
+effect_size_all
+```
+
+## Beta-Binomial concentration paramter
+
+```{r}
+# for every genus, calculate overdispersion
+estimate_genus_overdispersion <- function(sccomp_input_genus) {
+  
+  # total counts
+  sample_totals <- sccomp_input_genus %>%
+    group_by(sample) %>%
+    summarise(total = sum(count), .groups = "drop")
+  
+  sccomp_with_total <- sccomp_input_genus %>%
+    left_join(sample_totals, by = "sample")
+  
+  # Beta-Binomial
+  genus_params <- sccomp_with_total %>%
+    group_by(cell_group) %>%
+    summarise(
+      n_samples = n(),
+      mean_prop = mean(count / total),
+      var_prop = var(count / total),
+      mean_count = mean(count),
+      var_count = var(count),
+      prevalence = sum(count > 0) / n(),
+      .groups = "drop"
+    ) %>%
+    filter(prevalence >= 0.1) %>%  
+    mutate(
+      c0_estimated = pmax(
+        mean_prop * (1 - mean_prop) / var_prop - 1,
+        1 
+      )
+    )
+  
+  return(genus_params)
+}
+
+genus_overdispersion <- estimate_genus_overdispersion(sccomp_input_genus)
+
+summary(genus_overdispersion$c0_estimated)
+```
+
+
+## Library size mean
+
+```{r}
+real_libsize <- sccomp_input_genus %>%
+     group_by(sample) %>%
+     summarise(total = sum(count))
+   
+mean(real_libsize$total)
+```
+
+## Library size dispersion
+```{r}
+# Variance = mu + mu²/size
+1/(var(real_libsize$total)-mean(real_libsize$total))*(mean(real_libsize$total)^2)
+```
+
+
+# Proof of mean-variance entanglement
+
+For this step, we want to verify whether there is mean-variance entanglement in the real microbial data
+
+```{r}
+taxa_mean_var <- otu_wide %>%
+  summarise(across(everything(), 
+                   list(mean = mean, 
+                        var = var,
+                        n_nonzero = ~sum(. > 0)))) %>%
+  pivot_longer(everything(), 
+               names_to = c("genus", ".value"),
+               names_pattern = "(.*)_(mean|var|n_nonzero)") %>%
+  filter(mean > 0,       
+         var > 0,        # Add this to avoid log(0)
+         n_nonzero >= 5)
+
+lm_fit <- lm(log10(var) ~ log10(mean), data = taxa_mean_var)
+intercept <- coef(lm_fit)[1]
+slope <- coef(lm_fit)[2]
+a <- 10^intercept
+b <- slope
+r2 <- summary(lm_fit)$r.squared
+
+# Overall Power Law Fit
+p_1 <- ggplot(taxa_mean_var, aes(x = mean, y = var)) +
+  geom_point(alpha = 0.5, size = 2.5, color = "gray40") +
+  geom_smooth(method = "lm", color = "#E41A1C", 
+              fill = "#E41A1C", alpha = 0.2, linewidth = 1.2) +
+  scale_x_log10(
+    labels = scales::label_number(scale_cut = scales::cut_short_scale())
+  ) +
+  scale_y_log10(
+    labels = scales::label_number(scale_cut = scales::cut_short_scale())
+  ) +
+  annotate("text", 
+           x = min(taxa_mean_var$mean) * 2, 
+           y = max(taxa_mean_var$var) * 0.2, 
+           label = sprintf("var = %.2f × mean^%.2f\nR² = %.3f\np < 0.001",
+                          a, b, r2),
+           hjust = 0, vjust = 1, size = 4.5, 
+           color = "#E41A1C", fontface = "bold") +
+  labs(
+    title = "Power Law Relationship",
+    x = "Mean abundance",
+    y = "Variance",
+    tag = "A"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    plot.tag = element_text(face = "bold", size = 16),
+    plot.title = element_text(face = "bold", size = 13)
+  )
+
+# Abundance Bins
+taxa_mean_var <- taxa_mean_var %>%
+  mutate(
+    abundance_bin = cut(
+      log10(mean), 
+      breaks = quantile(log10(mean), probs = seq(0, 1, 0.25)),
+      labels = c("Low", "Medium-Low", "Medium-High", "High"),
+      include.lowest = TRUE
+    )
+  )
+
+p_2 <- ggplot(taxa_mean_var, aes(x = abundance_bin, y = var, fill = abundance_bin)) +
+  geom_violin(alpha = 0.6, scale = "width") +
+  geom_boxplot(width = 0.15, alpha = 0.8, outlier.alpha = 0.3, 
+               fill = "white") +
+  scale_y_log10(
+    labels = scales::label_number(scale_cut = scales::cut_short_scale())
+  ) +
+  scale_fill_brewer(palette = "YlOrRd") +
+  stat_summary(fun = median, geom = "point", 
+               shape = 18, size = 3, color = "black") +
+  labs(
+    title = "Variance by Abundance Level",
+    subtitle = "Higher abundance → Higher variance",
+    x = "Abundance Quartile",
+    y = "Variance (log10)",
+    tag = "B"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    plot.tag = element_text(face = "bold", size = 16),
+    plot.title = element_text(face = "bold", size = 13),
+    legend.position = "none",
+    axis.text.x = element_text(angle = 0, hjust = 0.5)
+  )
+
+print(p_1)
+print(p_2)
+```
+
+
+```{r}
+# calculate mean and variance for each taxon
+taxa_mean_var <- otu_wide %>%
+  summarise(across(everything(), 
+                   list(mean = mean, 
+                        var = var,
+                        n_nonzero = ~sum(. > 0)))) %>%
+  pivot_longer(everything(), 
+               names_to = c("taxon", ".value"),
+               names_pattern = "(.*)_(mean|var|n_nonzero)") %>%
+  filter(mean > 0,       
+         n_nonzero >= 5)  
+
+
+# visualization of mean-variance relationship
+p1 <- ggplot(taxa_mean_var, aes(x = mean, y = var)) +
+  geom_point(alpha = 0.5, size = 2) +
+  geom_smooth(method = "lm", color = "red", se = TRUE) +
+  scale_x_log10(labels = scales::scientific) +
+  scale_y_log10(labels = scales::scientific) +
+  labs(title = "Mean-Variance Relationship in Real Microbiome Data",
+       x = "Mean abundance (log10)",
+       y = "Variance (log10)",
+       subtitle = paste0("n = ", nrow(taxa_mean_var), " taxa")) +
+  theme_bw(base_size = 12)
+
+print(p1)
+
+# calculate the relationship
+
+# Pearson correlation (log scale)
+cor_pearson <- cor(log10(taxa_mean_var$mean), 
+                   log10(taxa_mean_var$var), 
+                   method = "pearson")
+
+# Spearman correlation (rank-based)
+cor_spearman <- cor(taxa_mean_var$mean, 
+                    taxa_mean_var$var, 
+                    method = "spearman")
+
+```
+
+
+```{r}
+# prove that mean-variance relationship is power law
+
+lm_fit <- lm(log10(var) ~ log10(mean), data = taxa_mean_var)
+summary(lm_fit)
+
+intercept <- coef(lm_fit)[1]
+slope <- coef(lm_fit)[2]
+a <- 10^intercept  # scale parameter
+b <- slope         # power law exponent
+
+# add predicted values
+taxa_mean_var <- taxa_mean_var %>%
+  mutate(var_predicted = a * mean^b)
+
+p2 <- ggplot(taxa_mean_var, aes(x = mean, y = var)) +
+  geom_point(alpha = 0.5, size = 2) +
+  geom_line(aes(y = var_predicted), color = "red", size = 1) +
+  scale_x_log10(labels = scales::scientific) +
+  scale_y_log10(labels = scales::scientific) +
+  labs(title = "Mean-Variance with Power Law Fit",
+       x = "Mean abundance (log10)",
+       y = "Variance (log10)",
+       subtitle = bquote(var == .(round(a, 2)) %.% mean^.(round(b, 2)) ~ 
+                         "," ~ R^2 == .(round(summary(lm_fit)$r.squared, 2)))) +
+  theme_bw(base_size = 12)
+
+print(p2)
+```
+
+In real microbiome data, we observed exceptionally strong mean-variance entanglement (Pearson = 0.981, Spearman = 0.981), indicating that mean abundance and variance are nearly perfectly coupled through a robust power law relationship: var ≈ 25.37 × mean^1.74 (R² = 0.96). This correlation is remarkably high (>0.98) and persists regardless of data transformation, demonstrating it is not a scale-dependent artifact. Practically, this means when a taxon's mean abundance increases 10-fold, its variance inevitably increases approximately 55-fold (10^1.74), making it virtually impossible to observe changes in composition without corresponding changes in variance patterns.
+
+
+# A
+```{r}
+simulate_scenario_A_CORRECT <- function(
+  n_samples_per_group = 150,
+  n_taxa = 200,
+  effect_size_log = 1,
+  prop_differential = 0.5,
+  mean_var_a = 25.37,
+  mean_var_b = 1.74,
+  libsize_mean = 15000,
+  libsize_dispersion = 3,
+  seed = NULL
+) {
+  if (!is.null(seed)) set.seed(seed)
+  
+  # Generate baseline
+  base_log <- rnorm(n_taxa, mean = 0, sd = 1)
+  pi1 <- exp(base_log)
+  pi1 <- pi1 / sum(pi1)
+  
+  # Select taxa
+  n_diff_up <- round(n_taxa * prop_differential / 2)
+  n_diff_down <- round(n_taxa * prop_differential / 2)
+  
+  up_idx <- sample(seq_len(n_taxa), n_diff_up)
+  remaining <- setdiff(seq_len(n_taxa), up_idx)
+  down_idx <- sample(remaining, n_diff_down)
+  null_idx <- setdiff(seq_len(n_taxa), c(up_idx, down_idx))
+  
+  fold_change <- exp(effect_size_log)
+  
+  # Start with pi1
+  pi2 <- pi1
+  
+  # Null taxa: keep EXACTLY the same
+  pi2[null_idx] <- pi1[null_idx]  # No change
+  
+  # Up/Down taxa: apply fold changes
+  pi2_up_raw <- pi1[up_idx] * fold_change
+  pi2_down_raw <- pi1[down_idx] / fold_change
+  
+  # Calculate how much we need to normalize
+  sum_null <- sum(pi1[null_idx])
+  sum_changed_raw <- sum(pi2_up_raw) + sum(pi2_down_raw)
+  
+  # Scale up/down taxa so that total = 1
+  scaling_factor <- (1 - sum_null) / sum_changed_raw
+  
+  pi2[up_idx] <- pi2_up_raw * scaling_factor
+  pi2[down_idx] <- pi2_down_raw * scaling_factor
+  
+  null_diffs <- pi2[null_idx] - pi1[null_idx]
+  
+  # Use average for phi calculation
+  pi_ref <- (pi1 + pi2) / 2
+  
+  # Calculate fixed precision
+  beta_latent_ref <- log(pi_ref + 1e-10) - mean(log(pi_ref + 1e-10))
+  
+  gamma0 <- log(mean_var_a)
+  gamma1 <- -(mean_var_b - 1)
+  sigma_alpha <- 0.3
+  
+  set.seed(seed + 1)
+  alpha_latent <- gamma0 + gamma1 * beta_latent_ref + rnorm(n_taxa, 0, sigma_alpha)
+  phi_j <- exp(alpha_latent)
+  
+  # Generate data
+  sim_group_BB <- function(pi_g, group_name = "") {
+    
+    counts <- matrix(0, nrow = n_samples_per_group, ncol = n_taxa)
+    L <- rnbinom(n_samples_per_group, mu = libsize_mean, size = libsize_dispersion)
+    
+    for (i in seq_len(n_samples_per_group)) {
+      for (j in seq_len(n_taxa)) {
+        alpha_j <- phi_j[j] * pi_g[j]
+        beta_j  <- phi_j[j] * (1 - pi_g[j])
+        
+        p_ij <- rbeta(1, alpha_j, beta_j)
+        counts[i, j] <- rbinom(1, size = L[i], prob = p_ij)
+      }
+    }
+    
+    counts
+  }
+  
+  counts_G1 <- sim_group_BB(pi1, "Group 1")
+  counts_G2 <- sim_group_BB(pi2, "Group 2")
+  
+  counts_all <- rbind(counts_G1, counts_G2)
+  group <- factor(c(rep("G1", n_samples_per_group), rep("G2", n_samples_per_group)))
+  rownames(counts_all) <- paste0("Sample_", seq_len(2 * n_samples_per_group))
+  colnames(counts_all) <- paste0("Taxon_", seq_len(n_taxa))
+  
+  list(
+    counts = counts_all,
+    group = group,
+    pi_G1 = pi1,
+    pi_G2 = pi2,
+    pi_ref = pi_ref,
+    phi_j = phi_j,
+    up_idx = up_idx,
+    down_idx = down_idx,
+    null_idx = null_idx,
+    ground_truth = list(
+      differential_composition = TRUE,
+      differential_variability = FALSE,
+      has_mean_variance_entanglement = TRUE
+    )
+  )
+}
+```
+
+## boxplot
+
+```{r}
+sim_alt <- simulate_scenario_A_CORRECT(
+  n_samples_per_group = 150,
+  n_taxa = 200,
+  effect_size_log = 1,
+  prop_differential = 0.5,
+  mean_var_a = 25.37,
+  mean_var_b = 1.74,
+  libsize_mean = 15000,
+  libsize_dispersion = 3,
+  seed = 1
+)
+
+calc_taxon_var <- function(counts, group, g) {
+  idx <- which(group == g)
+  props <- sweep(counts[idx, ], 1, rowSums(counts[idx, ]), "/")
+  apply(props, 2, function(x) var(asin(sqrt(x))))
+}
+
+var_G1 <- calc_taxon_var(sim_alt$counts, sim_alt$group, "G1")
+var_G2 <- calc_taxon_var(sim_alt$counts, sim_alt$group, "G2")
+
+boxplot_data <- data.frame(
+  variability = c(var_G1, var_G2),
+  group = factor(rep(c("G1", "G2"), each = 200), levels = c("G1", "G2"))
+)
+
+stats <- boxplot_data %>%
+  group_by(group) %>%
+  summarise(
+    median = median(variability),
+    q1 = quantile(variability, 0.25),
+    q3 = quantile(variability, 0.75),
+    iqr = IQR(variability)
+  )
+
+print(stats)
+
+p <- ggplot(boxplot_data, aes(x = group, y = variability, fill = group)) +
+  geom_boxplot(
+    outlier.shape = 1,
+    outlier.size = 2,
+    outlier.alpha = 0.5,
+    width = 0.5,
+    linewidth = 0.8
+  ) +
+  scale_fill_manual(values = c("G1" = "#87CEEB", "G2" = "#FF7F7F")) +
+  labs(
+    title = "Taxon-level variability",
+    y = "arcsin(sqrt(variance))",
+    x = ""
+  ) +
+  theme_classic() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5, size = 10),
+    axis.text = element_text(size = 12),
+    axis.title = element_text(size = 12),
+    panel.grid.major.y = element_line(color = "gray90", linetype = "dashed")
+  ) +
+  coord_cartesian(ylim = c(0, 0.01))
+
+print(p)
+```
+
+## Scenario A
+
+```{r, fig.width=14, fig.height=9, dpi=300, out.width="100%"}
+# sccomp
+
+sim_A1 <- simulate_scenario_A_CORRECT(
+  n_samples_per_group = 150,
+  n_taxa = 200,
+  effect_size_log = 1,
+  prop_differential = 0.5,
+  mean_var_a = 25.37,
+  mean_var_b = 1.74,
+  libsize_mean = 15000,
+  libsize_dispersion = 3,
+  seed = 1
+)
+
+sccomp_data <- prepare_sccomp_data(sim_A1$counts, sim_A1$group)
+
+sccomp_res_A1 <- sccomp_estimate(
+  .data = sccomp_data,
+  formula_composition  = ~ 1 + group,
+  formula_variability  = ~ 1 + group,
+  sample     = "sample",
+  cell_group = "cell_group",
+  abundance  = "count",
+  inference_method = "hmc",
+  verbose = FALSE
+)
+
+sccomp_test_res_A1 <- sccomp_test(sccomp_res_A1)
+
+plot(sccomp_test_res_A1)
+save(sccomp_res_A1, sccomp_test_res_A1,
+     file = "h2_A1.RData")
+load("h2_A1.RData")
+```
+
+
+
+
+## single test: betadisper
+```{r}
+sim_A1 <- simulate_scenario_A_CORRECT(
+  n_samples_per_group = 150,
+  n_taxa = 200,
+  effect_size_log = 1,
+  prop_differential = 0.5,
+  mean_var_a = 25.37,
+  mean_var_b = 1.74,
+  libsize_mean = 15000,
+  libsize_dispersion = 3,
+  seed = 123
+)
+
+relab_A <- sweep(sim_A1$counts, 1, rowSums(sim_A1$counts), "/")
+
+dist_bray_A <- vegdist(relab_A, method = "bray")
+
+bd_bray_A <- betadisper(dist_bray_A, sim_A1$group)
+
+create_betadisper_pcoa(bd_bray_A, sim_A1$group, "Bray-Curtis", "A")
+```
+
+
+## FPR: betadisper
+
+```{r}
+results_A <- run_100_sims(simulate_scenario_A_CORRECT, "A",
+                          n_samples_per_group = 150, n_taxa = 200)
+results_A
+```
+
+## low: more extreme cases
+
+```{r, fig.width=14, fig.height=9, dpi=300, out.width="100%"}
+# sccomp
+
+sim_A1 <- simulate_scenario_A_CORRECT(
+  n_samples_per_group = 150,
+  n_taxa = 200,
+  effect_size_log = 1,
+  prop_differential = 0.5,
+  mean_var_a = 25.37,
+  mean_var_b = 1,
+  libsize_mean = 15000,
+  libsize_dispersion = 3,
+  seed = 1
+)
+
+sccomp_data <- prepare_sccomp_data(sim_A1$counts, sim_A1$group)
+
+sccomp_res_A_extreme <- sccomp_estimate(
+  .data = sccomp_data,
+  formula_composition  = ~ 1 + group,
+  formula_variability  = ~ 1 + group,
+  sample     = "sample",
+  cell_group = "cell_group",
+  abundance  = "count",
+  inference_method = "hmc",
+  verbose = FALSE
+)
+
+sccomp_test_res_A_extreme <- sccomp_test(sccomp_res_A_extreme)
+
+two_D <- plot(sccomp_test_res_A_extreme)$credible_intervals_2D
+save(sccomp_res_A_extreme, sccomp_test_res_A_extreme,
+     file = "h2_A_extreme_no_ent.RData")
+ggsave(
+  "h2_no_entanglement.png",
+  two_D,
+  width = 18,
+  height = 12,
+  dpi = 300
+)
+```
+
+
+
+
+
+### low: FPR: betadisper
+
+```{r}
+results_A <- run_100_sims(simulate_scenario_A_CORRECT, "A",
+                          n_samples_per_group = 150, n_taxa = 200, mean_var_b = 1.1)
+
+fpr_summary <- calculate_fpr(results_A, alpha = 0.05)
+
+print(fpr_summary %>% 
+        select(scenario, distance, n_sims, n_rejected, fpr_percent, mean_p, median_p))
+
+```
+## high: more extreme cases
+
+```{r, fig.width=14, fig.height=9, dpi=300, out.width="100%"}
+# sccomp
+
+sim_A1 <- simulate_scenario_A_CORRECT(
+  n_samples_per_group = 150,
+  n_taxa = 200,
+  effect_size_log = 1,
+  prop_differential = 0.5,
+  mean_var_a = 25.37,
+  mean_var_b = 3,
+  libsize_mean = 15000,
+  libsize_dispersion = 3,
+  seed = 1
+)
+
+sccomp_data <- prepare_sccomp_data(sim_A1$counts, sim_A1$group)
+
+sccomp_res_A_high <- sccomp_estimate(
+  .data = sccomp_data,
+  formula_composition  = ~ 1 + group,
+  formula_variability  = ~ 1 + group,
+  sample     = "sample",
+  cell_group = "cell_group",
+  abundance  = "count",
+  inference_method = "hmc",
+  verbose = FALSE
+)
+
+sccomp_test_res_A_high <- sccomp_test(sccomp_res_A_high)
+
+two_D <- plot(sccomp_test_res_A_high)$credible_intervals_2D
+save(sccomp_res_A_high, sccomp_test_res_A_high,
+     file = "h2_A_extreme_high_ent.RData")
+ggsave(
+  "h2_high_entanglement.png",
+  two_D,
+  width = 18,
+  height = 12,
+  dpi = 300
+)
+```
+
+### high: FPR: betadisper
+
+```{r}
+results_A <- run_100_sims(simulate_scenario_A_CORRECT, "A",
+                          n_samples_per_group = 150, n_taxa = 200, mean_var_b = 2.9)
+
+fpr_summary <- calculate_fpr(results_A, alpha = 0.05)
+
+print(fpr_summary %>% 
+        select(scenario, distance, n_sims, n_rejected, fpr_percent, mean_p, median_p))
+
+```
+
+
+# Another way
+
+```{r}
+simulate_scenario_A_ALTERNATIVE <- function(
+  n_samples_per_group = 150,
+  n_taxa = 200,
+  effect_size = 2,
+  prop_differential = 0.5,
+  gamma0 = log(25.37),
+  gamma1 = -0.74,
+  sigma_alpha = 0.3,
+  libsize_mean = 15000,
+  libsize_dispersion = 3,
+  seed = NULL
+) {
+  if (!is.null(seed)) set.seed(seed)
+  
+  # Intercept (a)
+  a_c <- rnorm(n_taxa, mean = 0, sd = 2)
+  a_c <- a_c - mean(a_c)
+  
+  # Coefficient (b)
+  b_c <- rep(0, n_taxa)
+  
+  # Select differential taxa
+  n_diff_up <- round(n_taxa * prop_differential / 2)
+  n_diff_down <- round(n_taxa * prop_differential / 2)
+  up_idx <- sample(1:n_taxa, n_diff_up)
+  remaining <- setdiff(1:n_taxa, up_idx)
+  down_idx <- sample(remaining, n_diff_down)
+  null_idx <- setdiff(1:n_taxa, c(up_idx, down_idx))
+  
+  b_c[up_idx] <- effect_size
+  b_c[down_idx] <- -effect_size
+  b_c <- b_c - mean(b_c)
+  
+  # Calculate mu_latent
+  mu_latent_G1 <- a_c + b_c * 0  
+  mu_latent_G2 <- a_c + b_c * 1  
+  
+  # Calculate alpha_latent for each group
+  if (!is.null(seed)) set.seed(seed + 1)
+  alpha_latent_1 <- gamma0 + gamma1 * mu_latent_G1 
+  alpha_latent_2 <- gamma0 + gamma1 * mu_latent_G2
+  
+  softmax <- function(x) {
+    exp_x <- exp(x - max(x))
+    exp_x / sum(exp_x)
+  }
+  
+  pi_G1 <- softmax(mu_latent_G1)
+  pi_G2 <- softmax(mu_latent_G2)
+  
+  phi_1 <- exp(alpha_latent_1)
+  phi_2 <- exp(alpha_latent_2)
+  
+  sim_group_BB <- function(pi_g, phi_g, n_samples) {
+    counts <- matrix(0, nrow = n_samples, ncol = n_taxa)
+    L <- rnbinom(n_samples, mu = libsize_mean, size = libsize_dispersion)
+    
+    for (i in 1:n_samples) {
+      for (j in 1:n_taxa) {
+        alpha_j <- phi_g[j] * pi_g[j]
+        beta_j <- phi_g[j] * (1 - pi_g[j])
+        p_ij <- rbeta(1, alpha_j, beta_j)
+        counts[i, j] <- rbinom(1, size = L[i], prob = p_ij)
+      }
+    }
+    counts
+  }
+  
+  counts_G1 <- sim_group_BB(pi_G1, phi_1, n_samples_per_group)
+  counts_G2 <- sim_group_BB(pi_G2, phi_2, n_samples_per_group)
+  
+  counts_all <- rbind(counts_G1, counts_G2)
+  group <- factor(c(rep("G1", n_samples_per_group), 
+                    rep("G2", n_samples_per_group)))
+  
+  rownames(counts_all) <- paste0("Sample_", 1:(2*n_samples_per_group))
+  colnames(counts_all) <- paste0("Taxon_", 1:n_taxa)
+  
+  list(
+    counts = counts_all,
+    group = group,
+    mu_latent_G1 = mu_latent_G1,
+    mu_latent_G2 = mu_latent_G2,
+    alpha_latent_1 = alpha_latent_1,
+    alpha_latent_2 = alpha_latent_2,
+    a_c = a_c,
+    b_c = b_c,
+    gamma0 = gamma0,
+    gamma1 = gamma1,
+    pi_G1 = pi_G1,
+    pi_G2 = pi_G2,
+    phi_1 = phi_1,
+    phi_2 = phi_2,
+    up_idx = up_idx,
+    down_idx = down_idx,
+    null_idx = null_idx,
+    ground_truth = list(
+      differential_composition = TRUE,
+      differential_variability = FALSE,
+      has_mean_variance_entanglement = TRUE,
+      simulator_type = "stefano_specification"
+    )
+  )
+}
+```
+
+
+
+
+## Scenario A
+
+```{r, fig.width=14, fig.height=9, dpi=300, out.width="100%"}
+# sccomp
+
+sim_alt <- simulate_scenario_A_ALTERNATIVE(
+  n_samples_per_group = 75,
+  n_taxa = 100,
+  effect_size = 2,
+  prop_differential = 0.5,
+  gamma0 = log(25.37),
+  gamma1 = -0.74,
+  libsize_mean = 15000,
+  libsize_dispersion = 3,
+  seed = 1
+)
+
+# Prepare data for sccomp
+sccomp_data_alt <- prepare_sccomp_data(
+  sim_alt$counts, 
+  sim_alt$group
+)
+
+# Run sccomp
+sccomp_res_alt <- sccomp_estimate(
+  .data = sccomp_data_alt,
+  formula_composition  = ~ 1 + group,
+  formula_variability  = ~ 1 + group,
+  sample     = "sample",
+  cell_group = "cell_group",
+  abundance  = "count",
+  inference_method = "hmc",
+  verbose = FALSE
+)
+
+sccomp_test_alt <- sccomp_test(sccomp_res_alt)
+
+# Plot
+plot(sccomp_test_alt)
+
+# Save with descriptive name
+save(sccomp_res_alt, 
+     sccomp_test_alt,
+     file = "h2_A1_anotherway.RData")
+```
+
+
+```{r, fig.width=14, fig.height=9, dpi=300, out.width="100%"}
+# sccomp
+
+sim_alt <- simulate_scenario_A_ALTERNATIVE(
+  n_samples_per_group = 100,
+  n_taxa = 150,
+  effect_size = 2,
+  prop_differential = 0.5,
+  gamma0 = log(25.37),
+  gamma1 = -0.74,
+  libsize_mean = 15000,
+  libsize_dispersion = 3,
+  seed = 1
+)
+
+# Prepare data for sccomp
+sccomp_data_alt <- prepare_sccomp_data(
+  sim_alt$counts, 
+  sim_alt$group
+)
+
+# Run sccomp
+sccomp_res_alt1 <- sccomp_estimate(
+  .data = sccomp_data_alt,
+  formula_composition  = ~ 1 + group,
+  formula_variability  = ~ 1 + group,
+  sample     = "sample",
+  cell_group = "cell_group",
+  abundance  = "count",
+  inference_method = "hmc",
+  verbose = FALSE
+)
+
+sccomp_test_alt1 <- sccomp_test(sccomp_res_alt1)
+
+# Plot
+plot(sccomp_test_alt1)
+
+# Save with descriptive name
+save(sccomp_res_alt1, 
+     sccomp_test_alt1,
+     file = "h2_A1_anotherway1.RData")
+```
+
+
+
+```{r, fig.width=14, fig.height=9, dpi=300, out.width="100%"}
+# sccomp
+
+sim_alt <- simulate_scenario_A_ALTERNATIVE(
+  n_samples_per_group = 150,
+  n_taxa = 200,
+  effect_size = 2,
+  prop_differential = 0.5,
+  gamma0 = log(25.37),
+  gamma1 = -0.74,
+  libsize_mean = 15000,
+  libsize_dispersion = 3,
+  seed = 2
+)
+
+# Prepare data for sccomp
+sccomp_data_alt <- prepare_sccomp_data(
+  sim_alt$counts, 
+  sim_alt$group
+)
+
+# Run sccomp
+sccomp_res_alt2 <- sccomp_estimate(
+  .data = sccomp_data_alt,
+  formula_composition  = ~ 1 + group,
+  formula_variability  = ~ 1 + group,
+  sample     = "sample",
+  cell_group = "cell_group",
+  abundance  = "count",
+  inference_method = "hmc",
+  verbose = FALSE
+)
+
+sccomp_test_alt2 <- sccomp_test(sccomp_res_alt2)
+
+# Plot
+plot(sccomp_test_alt2)
+
+# Save with descriptive name
+save(sccomp_res_alt2, 
+     sccomp_test_alt2,
+     file = "h2_A1_anotherway2.RData")
+```
+
+```{r, fig.width=14, fig.height=9, dpi=300, out.width="100%"}
+# sccomp
+
+sim_alt <- simulate_scenario_A_ALTERNATIVE(
+  n_samples_per_group = 200,
+  n_taxa = 250,
+  effect_size = 2,
+  prop_differential = 0.5,
+  gamma0 = log(25.37),
+  gamma1 = -0.74,
+  libsize_mean = 15000,
+  libsize_dispersion = 3,
+  seed = 1
+)
+
+# Prepare data for sccomp
+sccomp_data_alt <- prepare_sccomp_data(
+  sim_alt$counts, 
+  sim_alt$group
+)
+
+# Run sccomp
+sccomp_res_alt3 <- sccomp_estimate(
+  .data = sccomp_data_alt,
+  formula_composition  = ~ 1 + group,
+  formula_variability  = ~ 1 + group,
+  sample     = "sample",
+  cell_group = "cell_group",
+  abundance  = "count",
+  inference_method = "hmc",
+  verbose = FALSE
+)
+
+sccomp_test_alt3 <- sccomp_test(sccomp_res_alt3)
+
+# Plot
+plot(sccomp_test_alt3)
+
+# Save with descriptive name
+save(sccomp_res_alt3, 
+     sccomp_test_alt3,
+     file = "h2_A1_anotherway3.RData")
+```
+
+# FPR: betadisper
+
+```{r}
+results_A <- run_100_sims(simulate_scenario_A_ALTERNATIVE, "A",
+                          n_samples_per_group = 150, n_taxa = 200)
+
+fpr_summary <- calculate_fpr(results_A, alpha = 0.05)
+
+print(fpr_summary %>% 
+        select(scenario, distance, n_sims, n_rejected, fpr_percent, mean_p, median_p))
+
+```
+
+
+# B
+```{r}
+simulate_scenario_B_CORRECT <- function(
+  n_samples_per_group = 150,
+  n_taxa = 200,
+  mean_var_a = 25.37,
+  mean_var_b = 1.74,
+  libsize_mean = 15000,
+  libsize_dispersion = 5,
+  seed = NULL
+) {
+  if (!is.null(seed)) set.seed(seed)
+  
+  # Generate baseline proportions for G1
+  base_log <- rnorm(n_taxa, mean = 0, sd = 1)
+  pi1 <- exp(base_log)
+  pi1 <- pi1 / sum(pi1)
+  
+  # *** KEY: Shuffle taxa labels for G2 ***
+  set.seed(seed + 100)
+  shuffled_idx <- sample(seq_len(n_taxa))
+  pi2 <- pi1[shuffled_idx]
+  
+  
+  # *** FIX: Define pi_ref ***
+  pi_ref <- pi1  # Use G1 as reference
+  
+  # Calculate fixed precision based on G1
+  beta_latent_ref <- log(pi_ref + 1e-10) - mean(log(pi_ref + 1e-10))
+  
+  gamma0 <- log(mean_var_a)
+  gamma1 <- -(mean_var_b - 1)
+  sigma_alpha <- 0.3
+  
+  set.seed(seed + 1)
+  alpha_latent <- gamma0 + gamma1 * beta_latent_ref + rnorm(n_taxa, 0, sigma_alpha)
+  phi_j <- exp(alpha_latent)
+  
+  # *** KEY: G2 uses shuffled phi ***
+  phi_j_G2 <- phi_j[shuffled_idx]
+  
+  # Generate data
+  sim_group_BB <- function(pi_g, phi_g, group_name = "") {
+    counts <- matrix(0, nrow = n_samples_per_group, ncol = n_taxa)
+    L <- rnbinom(n_samples_per_group, mu = libsize_mean, size = libsize_dispersion)
+    
+    for (i in seq_len(n_samples_per_group)) {
+      for (j in seq_len(n_taxa)) {
+        alpha_j <- phi_g[j] * pi_g[j]
+        beta_j  <- phi_g[j] * (1 - pi_g[j])
+        
+        p_ij <- rbeta(1, alpha_j, beta_j)
+        counts[i, j] <- rbinom(1, size = L[i], prob = p_ij)
+      }
+    }
+    
+    counts
+  }
+  
+  # G1: original pairing
+  counts_G1 <- sim_group_BB(pi1, phi_j, "Group 1")
+  
+  # G2: shuffled pairing
+  counts_G2 <- sim_group_BB(pi2, phi_j_G2, "Group 2")
+  
+  counts_all <- rbind(counts_G1, counts_G2)
+  group <- factor(c(rep("G1", n_samples_per_group), rep("G2", n_samples_per_group)))
+  rownames(counts_all) <- paste0("Sample_", seq_len(2 * n_samples_per_group))
+  colnames(counts_all) <- paste0("Taxon_", seq_len(n_taxa))
+  
+  list(
+    counts = counts_all,
+    group = group,
+    pi_G1 = pi1,
+    pi_G2 = pi2,
+    phi_j_G1 = phi_j,
+    phi_j_G2 = phi_j_G2,
+    shuffled_idx = shuffled_idx,
+    ground_truth = list(
+      differential_composition = TRUE,
+      differential_variability = FALSE,
+      has_mean_variance_entanglement = TRUE,
+      scenario_type = "perfect_shuffle"
+    )
+  )
+}
+```
+
+## Scenario B
+
+```{r, fig.width=14, fig.height=9, dpi=300, out.width="100%"}
+# sccomp
+
+sim_B1 <- simulate_scenario_B_CORRECT(
+  n_samples_per_group = 150,
+  n_taxa = 200,
+  mean_var_a = 25.37,
+  mean_var_b = 1.74,
+  libsize_mean = 15000,
+  libsize_dispersion = 5,
+  seed = 1
+)
+
+sccomp_data <- prepare_sccomp_data(sim_B1$counts, sim_B1$group)
+
+sccomp_res_B1 <- sccomp_estimate(
+  .data = sccomp_data,
+  formula_composition  = ~ 1 + group,
+  formula_variability  = ~ 1 + group,
+  sample     = "sample",
+  cell_group = "cell_group",
+  abundance  = "count",
+  inference_method = "hmc",
+  verbose = FALSE
+)
+
+sccomp_test_res_B1 <- sccomp_test(sccomp_res_B1)
+
+plot(sccomp_test_res_B1)
+save(sccomp_res_B1, sccomp_test_res_B1,
+     file = "h2_B1.RData")
+```
+
+
+## single test: betadisper
+```{r}
+relab_B <- sweep(sim_B1$counts, 1, rowSums(sim_B1$counts), "/")
+
+dist_bray_B <- vegdist(relab_B, method = "bray")
+
+bd_bray_B <- betadisper(dist_bray_B, sim_B1$group)
+```
+
+## betadisper
+
+```{r}
+results_B <- run_100_sims(simulate_scenario_B_CORRECT, "B",
+                          n_samples_per_group = 150, n_taxa = 200)
+```
+
+
+# C
+```{r}
+simulate_scenario_C_CORRECT <- function(
+  n_samples_per_group = 150,
+  n_taxa = 200,
+  effect_size_log = 1,
+  prop_differential = 0.5,
+  mean_var_a = 25.37,
+  mean_var_b = 1.74,
+  dv_effect_size = 0.5,  # How much to shift variability in G2
+  libsize_mean = 15000,
+  libsize_dispersion = 5,
+  seed = NULL
+) {
+  if (!is.null(seed)) set.seed(seed)
+  
+  # Generate baseline
+  base_log <- rnorm(n_taxa, mean = 0, sd = 1)
+  pi1 <- exp(base_log)
+  pi1 <- pi1 / sum(pi1)
+  
+  # Select taxa for DC
+  n_diff_up <- round(n_taxa * prop_differential / 2)
+  n_diff_down <- round(n_taxa * prop_differential / 2)
+  
+  up_idx <- sample(seq_len(n_taxa), n_diff_up)
+  remaining <- setdiff(seq_len(n_taxa), up_idx)
+  down_idx <- sample(remaining, n_diff_down)
+  null_idx <- setdiff(seq_len(n_taxa), c(up_idx, down_idx))
+  
+  # *** DC: Same as Scenario A ***
+  fold_change <- exp(effect_size_log)
+  pi2 <- pi1
+  pi2[null_idx] <- pi1[null_idx]
+  
+  pi2_up_raw <- pi1[up_idx] * fold_change
+  pi2_down_raw <- pi1[down_idx] / fold_change
+  
+  sum_null <- sum(pi1[null_idx])
+  sum_changed_raw <- sum(pi2_up_raw) + sum(pi2_down_raw)
+  scaling_factor <- (1 - sum_null) / sum_changed_raw
+  
+  pi2[up_idx] <- pi2_up_raw * scaling_factor
+  pi2[down_idx] <- pi2_down_raw * scaling_factor
+  
+  
+  # *** DV: Different precision parameters for G2 ***
+  pi_ref <- (pi1 + pi2) / 2
+  beta_latent_ref <- log(pi_ref + 1e-10) - mean(log(pi_ref + 1e-10))
+  
+  gamma0 <- log(mean_var_a)
+  gamma1 <- -(mean_var_b - 1)
+  sigma_alpha <- 0.3
+  
+  # G1: Standard precision
+  set.seed(seed + 1)
+  alpha_latent_G1 <- gamma0 + gamma1 * beta_latent_ref + 
+                     rnorm(n_taxa, 0, sigma_alpha)
+  phi_j_G1 <- exp(alpha_latent_G1)
+  
+  # G2: Shifted precision (increased variability)
+  set.seed(seed + 1)  # Same noise structure
+  alpha_latent_G2 <- (gamma0 - dv_effect_size) + gamma1 * beta_latent_ref + 
+                     rnorm(n_taxa, 0, sigma_alpha)
+  phi_j_G2 <- exp(alpha_latent_G2)
+  
+  # Generate data with group-specific precision
+  sim_group_BB <- function(pi_g, phi_g, group_name = "") {
+    
+    counts <- matrix(0, nrow = n_samples_per_group, ncol = n_taxa)
+    L <- rnbinom(n_samples_per_group, mu = libsize_mean, size = libsize_dispersion)
+    
+    for (i in seq_len(n_samples_per_group)) {
+       
+      
+      for (j in seq_len(n_taxa)) {
+        alpha_j <- phi_g[j] * pi_g[j]
+        beta_j  <- phi_g[j] * (1 - pi_g[j])
+        
+        p_ij <- rbeta(1, alpha_j, beta_j)
+        counts[i, j] <- rbinom(1, size = L[i], prob = p_ij)
+      }
+    }
+    
+    counts
+  }
+  
+  counts_G1 <- sim_group_BB(pi1, phi_j_G1, "Group 1")
+  counts_G2 <- sim_group_BB(pi2, phi_j_G2, "Group 2")
+  
+  counts_all <- rbind(counts_G1, counts_G2)
+  group <- factor(c(rep("G1", n_samples_per_group), rep("G2", n_samples_per_group)))
+  rownames(counts_all) <- paste0("Sample_", seq_len(2 * n_samples_per_group))
+  colnames(counts_all) <- paste0("Taxon_", seq_len(n_taxa))
+  
+  list(
+    counts = counts_all,
+    group = group,
+    pi_G1 = pi1,
+    pi_G2 = pi2,
+    phi_j_G1 = phi_j_G1,
+    phi_j_G2 = phi_j_G2,
+    up_idx = up_idx,
+    down_idx = down_idx,
+    null_idx = null_idx,
+    ground_truth = list(
+      differential_composition = TRUE,
+      differential_variability = TRUE,
+      has_mean_variance_entanglement = TRUE,
+      dv_effect_size = dv_effect_size
+    )
+  )
+}
+```
+
+## Scenario C
+
+```{r, fig.width=14, fig.height=9, dpi=300, out.width="100%"}
+# sccomp
+
+sim_C1 <- simulate_scenario_C_CORRECT(
+  n_samples_per_group = 150,
+  n_taxa = 200,
+  mean_var_a = 25.37,
+  mean_var_b = 1.74,
+  libsize_mean = 15000,
+  libsize_dispersion = 5,
+  seed = 1
+)
+
+sccomp_data <- prepare_sccomp_data(sim_C1$counts, sim_C1$group)
+
+sccomp_res_C1 <- sccomp_estimate(
+  .data = sccomp_data,
+  formula_composition  = ~ 1 + group,
+  formula_variability  = ~ 1 + group,
+  sample     = "sample",
+  cell_group = "cell_group",
+  abundance  = "count",
+  inference_method = "hmc",
+  verbose = FALSE
+)
+
+sccomp_test_res_C1 <- sccomp_test(sccomp_res_C1)
+
+plot(sccomp_test_res_C1)
+save(sccomp_res_C1, sccomp_test_res_C1,
+     file = "h2_C1.RData")
+```
+
+```{r}
+plot(sccomp_test_res_C1)$credible_intervals_2D
+```
+
+
+## single test: betadisper
+```{r}
+relab_C <- sweep(sim_C1$counts, 1, rowSums(sim_C1$counts), "/")
+
+dist_bray_C <- vegdist(relab_C, method = "bray")
+
+bd_bray_C <- betadisper(dist_bray_C, sim_C1$group)
+plot(bd_bray_C)
+```
+
+## FPR: betadisper
+```{r}
+results_C <- run_100_sims(simulate_scenario_C_CORRECT, "C",
+                          n_samples_per_group = 150, n_taxa = 200, dv_effect_size = 0.5)
+```
+
+
+# D
+```{r}
+simulate_scenario_D_CORRECT <- function(
+  n_samples_per_group = 150,
+  n_taxa = 200,
+  mean_var_a = 25.37,
+  mean_var_b = 1.74,
+  libsize_mean = 15000,
+  libsize_dispersion = 5,
+  seed = NULL
+) {
+  if (!is.null(seed)) set.seed(seed)
+  
+  # Generate shared baseline proportions
+  base_log <- rnorm(n_taxa, mean = 0, sd = 1)
+  pi_shared <- exp(base_log)
+  pi_shared <- pi_shared / sum(pi_shared)
+  
+  # Calculate shared precision
+  beta_latent <- log(pi_shared + 1e-10) - mean(log(pi_shared + 1e-10))
+  
+  gamma0 <- log(mean_var_a)
+  gamma1 <- -(mean_var_b - 1)
+  sigma_alpha <- 0.3
+  
+  set.seed(seed + 1)
+  alpha_latent <- gamma0 + gamma1 * beta_latent + rnorm(n_taxa, 0, sigma_alpha)
+  phi_j <- exp(alpha_latent)
+  
+  # Generate data (both groups identical distribution)
+  sim_group_BB <- function(group_name = "", seed_offset = 0) {
+    set.seed(seed + 10 + seed_offset)  # Different random seeds for independence
+    counts <- matrix(0, nrow = n_samples_per_group, ncol = n_taxa)
+    L <- rnbinom(n_samples_per_group, mu = libsize_mean, size = libsize_dispersion)
+    
+    for (i in seq_len(n_samples_per_group)) {
+       
+      
+      for (j in seq_len(n_taxa)) {
+        alpha_j <- phi_j[j] * pi_shared[j]
+        beta_j  <- phi_j[j] * (1 - pi_shared[j])
+        
+        p_ij <- rbeta(1, alpha_j, beta_j)
+        counts[i, j] <- rbinom(1, size = L[i], prob = p_ij)
+      }
+    }
+    
+    counts
+  }
+  
+  # Two independent samples from same distribution
+  counts_G1 <- sim_group_BB("Group 1", seed_offset = 0)
+  counts_G2 <- sim_group_BB("Group 2", seed_offset = 100)
+  
+  counts_all <- rbind(counts_G1, counts_G2)
+  group <- factor(c(rep("G1", n_samples_per_group), rep("G2", n_samples_per_group)))
+  rownames(counts_all) <- paste0("Sample_", seq_len(2 * n_samples_per_group))
+  colnames(counts_all) <- paste0("Taxon_", seq_len(n_taxa))
+  
+  list(
+    counts = counts_all,
+    group = group,
+    pi_shared = pi_shared,
+    phi_j = phi_j,
+    ground_truth = list(
+      differential_composition = FALSE,
+      differential_variability = FALSE,
+      has_mean_variance_entanglement = TRUE
+    )
+  )
+}
+```
+
+## Scenario D
+
+```{r, fig.width=14, fig.height=9, dpi=300, out.width="100%"}
+# sccomp
+
+sim_D1 <- simulate_scenario_D_CORRECT(
+  n_samples_per_group = 150,
+  n_taxa = 200,
+  mean_var_a = 25.37,
+  mean_var_b = 1.74,
+  libsize_mean = 15000,
+  libsize_dispersion = 5,
+  seed = 1
+)
+
+sccomp_data <- prepare_sccomp_data(sim_D1$counts, sim_D1$group)
+
+sccomp_res_D1 <- sccomp_estimate(
+  .data = sccomp_data,
+  formula_composition  = ~ 1 + group,
+  formula_variability  = ~ 1 + group,
+  sample     = "sample",
+  cell_group = "cell_group",
+  abundance  = "count",
+  inference_method = "hmc",
+  verbose = FALSE
+)
+
+sccomp_test_res_D1 <- sccomp_test(sccomp_res_D1)
+
+plot(sccomp_test_res_D1)
+save(sccomp_res_D1, sccomp_test_res_D1,
+     file = "h2_D1.RData")
+```
+
+## single test: betadisper
+```{r}
+relab_D <- sweep(sim_D1$counts, 1, rowSums(sim_D1$counts), "/")
+
+dist_bray_D <- vegdist(relab_D, method = "bray")
+
+bd_bray_D <- betadisper(dist_bray_D, sim_D1$group)
+```
+
+
+## FPR: betadisper
+```{r}
+results_D <- run_100_sims(simulate_scenario_D_CORRECT, "D",
+                          n_samples_per_group = 150, n_taxa = 200)
+```
+
+# null
+```{r}
+simulate_scenario_NULL <- function(
+  n_samples_per_group = 150,
+  n_taxa = 200,
+  gamma0 = log(25.37),
+  gamma1 = -0.74,
+  libsize_mean = 15000,
+  libsize_dispersion = 3,
+  seed = NULL
+) {
+  if (!is.null(seed)) set.seed(seed)
+  
+  # No differential composition: all b_c = 0
+  a_c <- rnorm(n_taxa, mean = 0, sd = 2)
+  a_c <- a_c - mean(a_c)  # sum to 0 constraint
+  
+  b_c <- rep(0, n_taxa)  # No group effect
+  
+  # mu_latent is the same for both groups
+  mu_latent_G1 <- a_c + b_c * 0  
+  mu_latent_G2 <- a_c + b_c * 1  # Same as G1 since b_c = 0
+  
+  # alpha_latent is the same for both groups (no DV)
+  if (!is.null(seed)) set.seed(seed + 1)
+  alpha_latent_1 <- gamma0 + gamma1 * mu_latent_G1 
+  alpha_latent_2 <- gamma0 + gamma1 * mu_latent_G2  # Same as G1
+  
+  softmax <- function(x) {
+    exp_x <- exp(x - max(x))
+    exp_x / sum(exp_x)
+  }
+  
+  pi_G1 <- softmax(mu_latent_G1)
+  pi_G2 <- softmax(mu_latent_G2)
+  
+  phi_1 <- exp(alpha_latent_1)
+  phi_2 <- exp(alpha_latent_2)
+  
+  sim_group_BB <- function(pi_g, phi_g, n_samples) {
+    counts <- matrix(0, nrow = n_samples, ncol = n_taxa)
+    L <- rnbinom(n_samples, mu = libsize_mean, size = libsize_dispersion)
+    
+    for (i in 1:n_samples) {
+      for (j in 1:n_taxa) {
+        alpha_j <- phi_g[j] * pi_g[j]
+        beta_j <- phi_g[j] * (1 - pi_g[j])
+        p_ij <- rbeta(1, alpha_j, beta_j)
+        counts[i, j] <- rbinom(1, size = L[i], prob = p_ij)
+      }
+    }
+    counts
+  }
+  
+  counts_G1 <- sim_group_BB(pi_G1, phi_1, n_samples_per_group)
+  counts_G2 <- sim_group_BB(pi_G2, phi_2, n_samples_per_group)
+  
+  counts_all <- rbind(counts_G1, counts_G2)
+  group <- factor(c(rep("G1", n_samples_per_group), 
+                    rep("G2", n_samples_per_group)))
+  
+  rownames(counts_all) <- paste0("Sample_", 1:(2*n_samples_per_group))
+  colnames(counts_all) <- paste0("Taxon_", 1:n_taxa)
+  
+  list(
+    counts = counts_all,
+    group = group,
+    mu_latent_G1 = mu_latent_G1,
+    mu_latent_G2 = mu_latent_G2,
+    alpha_latent_1 = alpha_latent_1,
+    alpha_latent_2 = alpha_latent_2,
+    a_c = a_c,
+    b_c = b_c,
+    gamma0 = gamma0,
+    gamma1 = gamma1,
+    pi_G1 = pi_G1,
+    pi_G2 = pi_G2,
+    phi_1 = phi_1,
+    phi_2 = phi_2,
+    up_idx = integer(0),
+    down_idx = integer(0),
+    null_idx = 1:n_taxa,
+    ground_truth = list(
+      differential_composition = FALSE,
+      differential_variability = FALSE,
+      has_mean_variance_entanglement = TRUE,
+      simulator_type = "null_scenario"
+    )
+  )
+}
+```
+
+
+```{r, fig.width=14, fig.height=9, dpi=300, out.width="100%"}
+# sccomp
+
+sim_alt <- simulate_scenario_NULL(
+  n_samples_per_group = 150,
+  n_taxa = 200,
+  gamma0 = log(25.37),
+  gamma1 = -0.74,
+  libsize_mean = 15000,
+  libsize_dispersion = 3,
+  seed = 1
+)
+
+# Prepare data for sccomp
+sccomp_data_alt <- prepare_sccomp_data(
+  sim_alt$counts, 
+  sim_alt$group
+)
+
+# Run sccomp
+sccomp_res_alt <- sccomp_estimate(
+  .data = sccomp_data_alt,
+  formula_composition  = ~ 1 + group,
+  formula_variability  = ~ 1 + group,
+  sample     = "sample",
+  cell_group = "cell_group",
+  abundance  = "count",
+  inference_method = "hmc",
+  verbose = FALSE
+)
+
+sccomp_test_alt <- sccomp_test(sccomp_res_alt)
+
+# Plot
+plot(sccomp_test_alt)
+
+```
+
+```{r}
+# 1. 检查ground truth
+sim_null <- simulate_scenario_NULL(n_samples_per_group = 150, n_taxa = 200, seed = 42)
+
+# 2. 计算empirical variance for each taxon in each group
+library(compositions)
+props_G1 <- proportions(sim_null$counts[1:150, ] + 1, margin = 1)
+props_G2 <- proportions(sim_null$counts[151:300, ] + 1, margin = 1)
+
+clr_G1 <- t(apply(props_G1, 1, function(x) log(x) - mean(log(x))))
+clr_G2 <- t(apply(props_G2, 1, function(x) log(x) - mean(log(x))))
+
+var_G1 <- apply(clr_G1, 2, var)
+var_G2 <- apply(clr_G2, 2, var)
+
+# 3. 看是否有systematic difference
+plot(var_G1, var_G2)
+abline(0, 1, col = "red")
+
+# 4. 计算mean abundance
+mean_G1 <- colMeans(clr_G1)
+mean_G2 <- colMeans(clr_G2)
+
+# 5. 检查mean-variance relationship
+plot(mean_G1, log(var_G1))
+plot(mean_G2, log(var_G2))
+```
+
+```{r}
+# 1. 检查latent space的真实关系
+plot(sim_null$mu_latent_G1, sim_null$alpha_latent_1, 
+     main = "Latent space (ground truth)")
+abline(lm(sim_null$alpha_latent_1 ~ sim_null$mu_latent_G1), col = "red")
+# Slope should be exactly -0.74
+
+# 2. 对比latent vs compositional
+par(mfrow = c(1, 2))
+# Latent
+plot(sim_null$mu_latent_G1, log(sim_null$phi_1), 
+     main = "Latent: log(phi) vs mu", xlab = "mu_latent", ylab = "log(phi)")
+
+# Compositional
+plot(mean_G1, log(var_G1), 
+     main = "Compositional: log(var) vs mean", xlab = "CLR mean", ylab = "log(CLR var)")
+
+# 3. 增加样本量测试
+sim_large <- simulate_scenario_NULL(n_samples_per_group = 1000, seed = 42)
+# 重新计算slopes，看是否收敛
+```
+
+
+# Summary table for betadisper
+```{r}
+# Combine results
+all_results <- rbind(results_A, results_B, results_C, results_D)
+
+# Calculate summary statistics
+summary_stats <- all_results %>%
+  group_by(scenario, distance) %>%
+  summarise(
+    rejection_rate = mean(p_value < 0.05),
+    median_p = median(p_value),
+    .groups = "drop"
+  )
+
+print(summary_stats)
+```
+
+
+# plot
+
+```{r}
+load("h2_A1.RData")
+load("h2_B1.RData")
+load("h2_C1.RData")
+load("h2_D1.RData")
+```
+
+```{r}
+# Scenario A 
+p_A1 <- create_betadisper_pcoa(bd_bray_A, sim_A1$group, "Bray-Curtis", "A")
+p_A2 <- create_rejection_barplot(summary_stats, "A", "Ground truth: FPR = 5%")
+p_A3 <- plot(sccomp_test_res_A1)$credible_intervals_2D
+
+# Scenario B
+p_B1 <- create_betadisper_pcoa(bd_bray_B, sim_B1$group, "Bray-Curtis", "B")
+p_B2 <- create_rejection_barplot(summary_stats, "B", "Ground truth: FPR = 5%")
+p_B3 <- plot(sccomp_test_res_B1)$credible_intervals_2D
+
+# Scenario C 
+p_C1 <- create_betadisper_pcoa(bd_bray_C, sim_C1$group, "Bray-Curtis", "C")
+p_C2 <- create_rejection_barplot(summary_stats, "C", "Ground truth: Should detect >80%")
+p_C3 <- plot(sccomp_test_res_C1)$credible_intervals_2D
+
+# Scenario D 
+p_D1 <- create_betadisper_pcoa(bd_bray_D, sim_D1$group, "Bray-Curtis", "D")
+p_D2 <- create_rejection_barplot(summary_stats, "D", "Ground truth: FPR = 5%")
+p_D3 <- plot(sccomp_test_res_D1)$credible_intervals_2D
+
+row1 <- (p_1 | p_2) + 
+  plot_layout(widths = c(1, 1))
+
+# Scenario A
+row2 <- (p_A1 | p_A2 | p_A3) + 
+  plot_layout(widths = c(0.8, 0.8, 1.8))
+
+# Scenario B
+row3 <- (p_B1 | p_B2 | p_B3) + 
+  plot_layout(widths = c(0.8, 0.8, 1.8))
+
+# Scenario C
+row4 <- (p_C2 | p_C3 | p_D2 | p_D3) + 
+  plot_layout(widths = c(0.6, 1, 0.6, 1))
+
+```
+
+```{r}
+layout_final <- 
+  row1 / row2 / row3 / row4 +
+  plot_layout(heights = c(0.6, 1.2, 1.2, 1.2)) +
+  plot_annotation(
+    title = "Mean-Variance Entanglement Causes False Positive DV Detection",
+    subtitle = "Comparison of betadisper and sccomp across simulation scenarios",
+    tag_levels = 'A',
+    theme = theme(
+      plot.title = element_text(size = 16, face = "bold"),
+      plot.subtitle = element_text(size = 12)
+    )
+  )
+
+ggsave("h2_plot.png", layout_final, width = 18, height = 20, dpi = 300)
+```
+
+
+# figure 1
+
+
+```{r}
+library(uwot)
+
+create_scenario_panel <- function(sim_result,
+                                  scenario_name,
+                                  scenario_title,
+                                  scenario_subtitle) {
+
+  counts <- sim_result$counts
+  group  <- sim_result$group
+
+  # 1. UMAP
+  relab <- sweep(counts, 1, rowSums(counts), "/")
+
+  set.seed(42)
+  umap_result <- uwot::umap(relab, n_neighbors = 15, min_dist = 0.1)
+
+  umap_df <- data.frame(
+    UMAP1 = umap_result[,1],
+    UMAP2 = umap_result[,2],
+    Group = group
+  )
+
+  p_umap <- ggplot(umap_df, aes(UMAP1, UMAP2, color = Group)) +
+    geom_point(size = 2.5, alpha = 0.7) +
+    scale_color_manual(values = c(G1="#377EB8", G2="#E41A1C")) +
+    labs(title = "Sample Distribution", x = "UMAP 1", y = "UMAP 2") +
+    theme_bw(base_size = 11) +
+    theme(legend.position = "bottom",
+          legend.title = element_blank(),
+          plot.title = element_text(face="bold"))
+
+  # 2. Community composition barplot
+  top_taxa <- names(sort(colMeans(relab), decreasing = TRUE)[1:2])
+
+  relab_top   <- relab[, top_taxa]
+  relab_other <- rowSums(relab[, !colnames(relab) %in% top_taxa])
+  relab_plot  <- cbind(relab_top, Other = relab_other)
+
+  relab_long <- relab_plot |>
+    as.data.frame() |>
+    tibble::rownames_to_column("sample") |>
+    mutate(group = group,
+           sample_id = row_number()) |>
+    tidyr::pivot_longer(-c(sample, group, sample_id),
+                        names_to="taxon",
+                        values_to="proportion")
+
+  sample_order <- relab_long |>
+    distinct(sample, group, sample_id) |>
+    arrange(group, sample_id) |>
+    mutate(plot_order = row_number())
+
+  relab_long <- relab_long |>
+    left_join(sample_order |> select(sample, plot_order), by="sample")
+
+  p_barplot <- ggplot(relab_long,
+                      aes(plot_order, proportion, fill = taxon)) +
+    geom_bar(stat="identity", width=1) +
+    scale_y_continuous(expand=c(0,0)) +
+    labs(title="Community Composition",
+         y="Relative abundance",
+         x=NULL) +
+    theme_minimal(base_size=11) +
+    theme(legend.position="none",
+          axis.text.x=element_blank(),
+          axis.ticks.x=element_blank(),
+          plot.title=element_text(face="bold")) +
+    geom_vline(xintercept = sum(group=="G1") + 0.5,
+               linetype="dashed")
+
+  # 3. Mean–SD relationship
+  
+  relab_df <- as.data.frame(relab)
+  
+  taxa_stats <- lapply(levels(group), function(g) {
+    mat <- relab_df[group == g, , drop = FALSE]
+    data.frame(
+      taxon = colnames(mat),
+      mean  = colMeans(mat),
+      sd    = apply(mat, 2, sd),
+      Group = g
+    )
+  }) |>
+    bind_rows() |>
+    filter(mean > 0, sd > 0)
+  
+  rho_all <- cor(taxa_stats$mean,
+                 taxa_stats$sd,
+                 method = "spearman")
+  
+  p_meansd <- ggplot(taxa_stats, aes(mean, sd)) +
+    geom_point(aes(color = Group), alpha = 0.6, size = 2) +
+    geom_smooth(aes(group = 1), method = "loess", se = TRUE,
+                linewidth = 1, color = "black") +
+    scale_color_manual(values = c(G1 = "#377EB8", G2 = "#E41A1C")) +
+    labs(title = "Mean–SD Relationship",
+         subtitle = paste0("Spearman ρ = ", round(rho_all, 3)),
+         x = "Mean proportion",
+         y = "Standard deviation") +
+    theme_bw(base_size = 11) +
+    theme(plot.title = element_text(face = "bold"),
+          legend.position = "bottom",
+          legend.title = element_blank())
+
+  # Combine into one panel with title
+  combined <- (p_umap | p_barplot | p_meansd) +
+    patchwork::plot_layout(widths = c(1, 1.5, 1)) +
+    patchwork::plot_annotation(
+      title = paste0(scenario_name, ". ", scenario_title),
+      subtitle = scenario_subtitle,
+      theme = theme(
+        plot.title = element_text(face = "bold", size = 14),
+        plot.subtitle = element_text(size = 10)
+      )
+    )
+  
+  return(combined)
+}
+
+# Create panels
+panel_A <- create_scenario_panel(
+  sim_A1, "A", 
+  "Scenario A: Differential Composition without Differential Variability",
+  "50% taxa changed | n = 150 samples/group, 200 taxa"
+)
+
+panel_B <- create_scenario_panel(
+  sim_B1, "B", 
+  "Scenario B: Perfect Shuffle",
+  "All taxa redistributed | n = 150 samples/group, 200 taxa"
+)
+
+panel_C <- create_scenario_panel(
+  sim_C1, "C",
+  "Scenario C: Differential Composition AND Differential Variability",
+  "50% taxa changed + precision shift | n = 150 samples/group, 200 taxa"
+)
+
+panel_D <- create_scenario_panel(
+  sim_D1, "D",
+  "Scenario D: Null Control",
+  "No changes | n = 150 samples/group, 200 taxa"
+)
+
+figure_main <- (
+  wrap_elements(panel_A) | wrap_elements(panel_B)
+) / (
+  wrap_elements(panel_C) | wrap_elements(panel_D)
+)
+
+ggsave(
+  "h2_Figure1_v1.png",
+  figure_main,
+  width = 18,
+  height = 12,
+  dpi = 300
+)
+
+```
+
+# f1 v2
+```{r}
+library(uwot)
+library(patchwork)
+
+create_scenario_panel <- function(sim_result,
+                                  scenario_name,
+                                  scenario_title,
+                                  scenario_subtitle) {
+
+  counts <- sim_result$counts
+  group  <- sim_result$group
+
+  # 1. UMAP
+  relab <- sweep(counts, 1, rowSums(counts), "/")
+
+  set.seed(42)
+  umap_result <- uwot::umap(relab, n_neighbors = 15, min_dist = 0.1)
+
+  umap_df <- data.frame(
+    UMAP1 = umap_result[,1],
+    UMAP2 = umap_result[,2],
+    Group = group
+  )
+
+  p_umap <- ggplot(umap_df, aes(UMAP1, UMAP2, color = Group)) +
+    geom_point(size = 2.5, alpha = 0.7) +
+    scale_color_manual(values = c(G1="#377EB8", G2="#E41A1C")) +
+    labs(title = "Sample Distribution", x = "UMAP 1", y = "UMAP 2") +
+    theme_bw(base_size = 11) +
+    theme(legend.position = "bottom",
+          legend.title = element_blank(),
+          plot.title = element_text(face="bold"))
+
+  # 2. Community composition barplot - SUBSET SAMPLES
+  
+  # Randomly select 30 samples per group for visualization
+  set.seed(123)  # Different seed from UMAP for independence
+  idx_g1 <- which(group == "G1")
+  idx_g2 <- which(group == "G2")
+  
+  sample_subset <- c(
+    sample(idx_g1, min(30, length(idx_g1))),
+    sample(idx_g2, min(30, length(idx_g2)))
+  )
+  
+  relab_subset <- relab[sample_subset, ]
+  group_subset <- group[sample_subset]
+  
+  # Use top 20 taxa for better visualization
+  top_taxa <- names(sort(colMeans(relab), decreasing = TRUE)[1:20])
+
+  relab_top   <- relab_subset[, top_taxa]
+  relab_other <- rowSums(relab_subset[, !colnames(relab_subset) %in% top_taxa])
+  relab_plot  <- cbind(relab_top, Other = relab_other)
+
+  relab_long <- relab_plot |>
+    as.data.frame() |>
+    tibble::rownames_to_column("sample") |>
+    mutate(group = group_subset,
+           sample_id = row_number()) |>
+    tidyr::pivot_longer(-c(sample, group, sample_id),
+                        names_to="taxon",
+                        values_to="proportion")
+
+  sample_order <- relab_long |>
+    distinct(sample, group, sample_id) |>
+    arrange(group, sample_id) |>
+    mutate(plot_order = row_number())
+
+  relab_long <- relab_long |>
+    left_join(sample_order |> select(sample, plot_order), by="sample")
+
+  p_barplot <- ggplot(relab_long,
+                      aes(plot_order, proportion, fill = taxon)) +
+    geom_bar(stat="identity", width=1) +
+    scale_y_continuous(expand=c(0,0)) +
+    labs(title="Community Composition",
+         subtitle = "30 samples/group shown",
+         y="Relative abundance",
+         x=NULL) +
+    theme_minimal(base_size=11) +
+    theme(legend.position="none",
+          axis.text.x=element_blank(),
+          axis.ticks.x=element_blank(),
+          plot.title=element_text(face="bold"),
+          plot.subtitle=element_text(size=9, color="gray40")) +
+    geom_vline(xintercept = sum(group_subset=="G1") + 0.5,
+               linetype="dashed")
+
+  # 3. Mean–SD relationship
+  
+  relab_df <- as.data.frame(relab)
+  
+  taxa_stats <- lapply(levels(group), function(g) {
+    mat <- relab_df[group == g, , drop = FALSE]
+    data.frame(
+      taxon = colnames(mat),
+      mean  = colMeans(mat),
+      sd    = apply(mat, 2, sd),
+      Group = g
+    )
+  }) |>
+    bind_rows() |>
+    filter(mean > 0, sd > 0)
+  
+  rho_all <- cor(taxa_stats$mean,
+                 taxa_stats$sd,
+                 method = "spearman")
+  
+  p_meansd <- ggplot(taxa_stats, aes(mean, sd)) +
+    geom_point(aes(color = Group), alpha = 0.6, size = 2) +
+    geom_smooth(aes(group = 1), method = "loess", se = TRUE,
+                linewidth = 1, color = "black") +
+    scale_color_manual(values = c(G1 = "#377EB8", G2 = "#E41A1C")) +
+    labs(title = "Mean–SD Relationship",
+         subtitle = paste0("Spearman ρ = ", round(rho_all, 3)),
+         x = "Mean proportion",
+         y = "Standard deviation") +
+    theme_bw(base_size = 11) +
+    theme(plot.title = element_text(face = "bold"),
+          legend.position = "bottom",
+          legend.title = element_blank())
+
+  # Combine into one panel with title
+  combined <- (p_umap | p_barplot | p_meansd) +
+    patchwork::plot_layout(widths = c(1, 1.2, 1)) +
+    patchwork::plot_annotation(
+      title = paste0(scenario_name, ". ", scenario_title),
+      subtitle = scenario_subtitle,
+      theme = theme(
+        plot.title = element_text(face = "bold", size = 14),
+        plot.subtitle = element_text(size = 10)
+      )
+    )
+  
+  return(combined)
+}
+
+# Create panels
+panel_A <- create_scenario_panel(
+  sim_A1, "A", 
+  "Scenario A: Differential Composition without Differential Variability",
+  "50% taxa changed | n = 150 samples/group, 200 taxa"
+)
+
+panel_B <- create_scenario_panel(
+  sim_B1, "B", 
+  "Scenario B: Perfect Shuffle",
+  "All taxa redistributed | n = 150 samples/group, 200 taxa"
+)
+
+panel_C <- create_scenario_panel(
+  sim_C1, "C",
+  "Scenario C: Differential Composition AND Differential Variability",
+  "50% taxa changed + precision shift | n = 150 samples/group, 200 taxa"
+)
+
+panel_D <- create_scenario_panel(
+  sim_D1, "D",
+  "Scenario D: Null Control",
+  "No changes | n = 150 samples/group, 200 taxa"
+)
+
+figure_main <- (
+  wrap_elements(panel_A) | wrap_elements(panel_B)
+) / (
+  wrap_elements(panel_C) | wrap_elements(panel_D)
+)
+
+ggsave(
+  "h2_Figure1_v2_subset.png",
+  figure_main,
+  width = 18,
+  height = 12,
+  dpi = 300
+)
+```
+
+
+# figure 1
+
+
+```{r}
+library(uwot)
+library(patchwork)
+
+create_scenario_panel <- function(sim_result,
+                                  scenario_name,
+                                  scenario_title,
+                                  scenario_subtitle) {
+
+  counts <- sim_result$counts
+  group  <- sim_result$group
+
+  # =====================================================
+  # 1. UMAP
+  # =====================================================
+  relab <- sweep(counts, 1, rowSums(counts), "/")
+
+  set.seed(42)
+  umap_result <- uwot::umap(relab, n_neighbors = 15, min_dist = 0.1)
+
+  umap_df <- data.frame(
+    UMAP1 = umap_result[,1],
+    UMAP2 = umap_result[,2],
+    Group = group
+  )
+
+  p_umap <- ggplot(umap_df, aes(UMAP1, UMAP2, color = Group)) +
+    geom_point(size = 2.5, alpha = 0.7) +
+    scale_color_manual(values = c(G1="#377EB8", G2="#E41A1C")) +
+    labs(title = "Sample Distribution", x = "UMAP 1", y = "UMAP 2") +
+    theme_bw(base_size = 11) +
+    theme(legend.position = "bottom",
+          legend.title = element_blank(),
+          plot.title = element_text(face="bold"))
+
+  # 2. Community composition barplot
+  top_taxa <- names(sort(colMeans(relab), decreasing = TRUE)[1:15])
+  
+  mean_comparison <- data.frame(
+    taxon = rep(top_taxa, 2),
+    Group = rep(c("G1", "G2"), each = length(top_taxa)),
+    mean_abundance = c(
+      colMeans(relab[group == "G1", top_taxa]),
+      colMeans(relab[group == "G2", top_taxa])
+    )
+  )
+  
+  p_barplot <- ggplot(mean_comparison, 
+                      aes(x = reorder(taxon, mean_abundance), 
+                          y = mean_abundance, 
+                          fill = Group)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    coord_flip() +
+    scale_fill_manual(values = c(G1="#377EB8", G2="#E41A1C")) +
+    labs(title = "Mean Abundance Comparison",
+         y = "Mean relative abundance",
+         x = NULL) +
+    theme_bw(base_size = 11) +
+    theme(legend.position = "bottom")
+
+  # 3. Mean–SD relationship
+  
+  relab_df <- as.data.frame(relab)
+  
+  taxa_stats <- lapply(levels(group), function(g) {
+    mat <- relab_df[group == g, , drop = FALSE]
+    data.frame(
+      taxon = colnames(mat),
+      mean  = colMeans(mat),
+      sd    = apply(mat, 2, sd),
+      Group = g
+    )
+  }) |>
+    bind_rows() |>
+    filter(mean > 0, sd > 0)
+  
+  rho_all <- cor(taxa_stats$mean,
+                 taxa_stats$sd,
+                 method = "spearman")
+  
+  p_meansd <- ggplot(taxa_stats, aes(mean, sd)) +
+    geom_point(aes(color = Group), alpha = 0.6, size = 2) +
+    geom_smooth(aes(group = 1), method = "loess", se = TRUE,
+                linewidth = 1, color = "black") +
+    scale_color_manual(values = c(G1 = "#377EB8", G2 = "#E41A1C")) +
+    labs(title = "Mean–SD Relationship",
+         subtitle = paste0("Spearman ρ = ", round(rho_all, 3)),
+         x = "Mean proportion",
+         y = "Standard deviation") +
+    theme_bw(base_size = 11) +
+    theme(plot.title = element_text(face = "bold"),
+          legend.position = "bottom",
+          legend.title = element_blank())
+
+  # Combine into one panel with title
+  combined <- (p_umap | p_barplot | p_meansd) +
+    patchwork::plot_layout(widths = c(1, 1.2, 1)) +
+    patchwork::plot_annotation(
+      title = paste0(scenario_name, ". ", scenario_title),
+      subtitle = scenario_subtitle,
+      theme = theme(
+        plot.title = element_text(face = "bold", size = 14),
+        plot.subtitle = element_text(size = 10)
+      )
+    )
+  
+  return(combined)
+}
+
+# Create panels
+panel_A <- create_scenario_panel(
+  sim_A1, "A", 
+  "Scenario A: Differential Composition without Differential Variability",
+  "50% taxa changed | n = 150 samples/group, 200 taxa"
+)
+
+panel_B <- create_scenario_panel(
+  sim_B1, "B", 
+  "Scenario B: Perfect Shuffle",
+  "All taxa redistributed | n = 150 samples/group, 200 taxa"
+)
+
+panel_C <- create_scenario_panel(
+  sim_C1, "C",
+  "Scenario C: Differential Composition AND Differential Variability",
+  "50% taxa changed + precision shift | n = 150 samples/group, 200 taxa"
+)
+
+panel_D <- create_scenario_panel(
+  sim_D1, "D",
+  "Scenario D: Null Control",
+  "No changes | n = 150 samples/group, 200 taxa"
+)
+
+figure_main <- (
+  wrap_elements(panel_A) | wrap_elements(panel_B)
+) / (
+  wrap_elements(panel_C) | wrap_elements(panel_D)
+)
+
+ggsave(
+  "h2_Figure1.png",
+  figure_main,
+  width = 18,
+  height = 12,
+  dpi = 300
+)
+
+```
+
+# figure 2
+```{r}
+fit_crc <- attr(result_tested_crc, "fit")
+
+draws <- fit_crc |> 
+  as_draws_df()
+
+library(tidyverse)
+library(posterior)
+
+# 提取 fit
+fit_crc <- attr(result_tested_crc, "fit")
+
+# 从 posterior draws 提取参数
+draws <- fit_crc |> as_draws_df()
+
+# 提取 beta (mean) 和 alpha (precision) 的后验中位数
+# beta 是 [C, M] 矩阵，我们只要第一行 (intercept)
+# alpha 是 [A, M] 矩阵，我们只要第一行 (intercept)
+
+# 获取有多少个 taxa
+taxa_names <- unique(result_tested_crc$cell_group)
+M <- length(taxa_names)
+
+# 提取 beta[1,m] 和 alpha[1,m] (第一行是intercept)
+beta_intercepts <- draws |> 
+  select(matches("^beta\\[1,")) |>
+  summarise(across(everything(), median)) |>
+  pivot_longer(everything(), names_to = "param", values_to = "mean")
+
+alpha_intercepts <- draws |> 
+  select(matches("^alpha\\[1,")) |>
+  summarise(across(everything(), median)) |>
+  pivot_longer(everything(), names_to = "param", values_to = "precision")
+
+# 合并
+df_entanglement <- tibble(
+  taxa_id = 1:M,
+  mean = beta_intercepts$mean,
+  precision = alpha_intercepts$precision
+)
+
+# 计算相关
+cor_result <- cor.test(df_entanglement$mean, df_entanglement$precision)
+
+# 画图
+p <- ggplot(df_entanglement, aes(x = mean, y = precision)) +
+  geom_point(alpha = 0.6, size = 3, color = "#2E86AB") +
+  geom_smooth(method = "lm", se = TRUE, color = "#A23B72", linewidth = 1.2) +
+  annotate(
+    "text", 
+    x = min(df_entanglement$mean), 
+    y = max(df_entanglement$precision),
+    label = sprintf("r = %.3f\np = %.2e", 
+                    cor_result$estimate, cor_result$p.value),
+    hjust = 0, vjust = 1, size = 5
+  ) +
+  labs(
+    x = "Mean (log composition, β intercept)",
+    y = "Precision (log scale, α intercept)",
+    title = "Mean-precision entanglement in CRC microbiome"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+print(p)
+
+cat(sprintf("\nMean-precision correlation:\n"))
+cat(sprintf("  r = %.4f\n", cor_result$estimate))
+cat(sprintf("  p = %.2e\n", cor_result$p.value))
+cat(sprintf("  N taxa = %d\n", nrow(df_entanglement)))
+```
+
+```{r}
+library(tidyverse)
+library(umap)
+library(patchwork)
+
+# 1. 准备count矩阵用于UMAP (taxa × samples)
+count_wide <- sccomp_input |>
+  select(cell_group, sample, count) |>
+  pivot_wider(names_from = sample, values_from = count, values_fill = 0) |>
+  column_to_rownames("cell_group")
+
+# 2. 对count做log转换和标准化
+count_matrix_log <- log1p(count_wide)
+
+# 3. 运行UMAP
+set.seed(123)
+umap_result <- umap(count_matrix_log)
+
+# 4. 合并UMAP坐标和mean abundance
+umap_df <- tibble(
+  taxa = rownames(count_wide),
+  UMAP1 = umap_result$layout[,1],
+  UMAP2 = umap_result$layout[,2]
+) |>
+  left_join(
+    df_entanglement |> mutate(taxa = taxa_names),
+    by = "taxa"
+  )
+
+# 5. 画UMAP (左图)
+p_umap <- ggplot(umap_df, aes(x = UMAP1, y = UMAP2, color = mean)) +
+  geom_point(size = 3, alpha = 0.7) +
+  scale_color_viridis_c(option = "plasma", name = "Mean\nabundance") +
+  labs(
+    title = "A. Taxa distribution (UMAP)",
+    x = "UMAP 1",
+    y = "UMAP 2"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    legend.position = "right"
+  )
+
+# 6. 更新相关图 (右图)
+p_corr <- ggplot(df_entanglement, aes(x = mean, y = precision)) +
+  geom_point(alpha = 0.6, size = 3, color = "#2E86AB") +
+  geom_smooth(method = "lm", se = TRUE, color = "#A23B72", linewidth = 1.2) +
+  annotate(
+    "text", 
+    x = min(df_entanglement$mean), 
+    y = max(df_entanglement$precision),
+    label = sprintf("r = %.3f\np = %.2e", 
+                    cor_result$estimate, cor_result$p.value),
+    hjust = 0, vjust = 1, size = 5
+  ) +
+  labs(
+    title = "B. Mean-precision entanglement",
+    x = "Mean (log composition, β)",
+    y = "Precision (log scale, α)"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+# 7. 组合两个图
+p_combined <- p_umap + p_corr + plot_layout(widths = c(1.2, 1))
+
+print(p_combined)
+
+
+```
+
+$$
+\subsection{Mean-precision entanglement in microbiome data}
+
+\subsubsection{Mathematical independence of parameters}
+
+In the Stan parameterization of the Beta-Binomial distribution, the mean and precision are mathematically independent parameters. The Beta-Binomial likelihood is defined as:
+\begin{equation}
+Y \sim \text{BetaBinomial}(n, \alpha, \beta)
+\end{equation}
+
+We reparameterize using mean $\mu$ and precision $\phi$:
+\begin{align}
+\mu &= \frac{\alpha}{\alpha + \beta} \quad \text{(mean)} \\
+\phi &= \alpha + \beta \quad \text{(precision)}
+\end{align}
+
+The inverse transformation gives:
+\begin{align}
+\alpha &= \mu \cdot \phi \\
+\beta &= (1 - \mu) \cdot \phi
+\end{align}
+
+These parameters are mathematically independent because:
+\begin{align}
+\frac{\partial \mu}{\partial \phi} &= 0 \\
+\frac{\partial \phi}{\partial \mu} &= 0
+\end{align}
+
+For any fixed precision $\phi > 0$, the mean $\mu$ can vary freely over $(0,1)$, and vice versa. This orthogonal parameterization ensures that changes in mean do not mathematically constrain precision, and changes in precision do not constrain mean.
+
+\subsubsection{Empirical mean-precision entanglement}
+
+Despite their theoretical independence, we observe strong empirical correlation between mean abundance and precision in real microbiome data. Figure~\ref{fig:entanglement} demonstrates this phenomenon using the CRC dataset. UMAP visualization (Figure~\ref{fig:entanglement}A) shows taxa clustering by mean abundance, while the correlation analysis (Figure~\ref{fig:entanglement}B) reveals a strong negative association between mean log abundance ($\beta$ intercept) and log precision ($\alpha$ intercept) (Pearson's $r = -0.63$, $p < 10^{-7}$).
+
+This negative correlation indicates that high-abundance taxa systematically exhibit lower precision (i.e., higher overdispersion). This mean-variance entanglement creates a fundamental challenge for differential variability testing: observed differences in variability may simply reflect differences in mean abundance rather than true biological variation in dispersion. Traditional methods that do not account for this relationship are prone to high false-positive rates, as demonstrated in our simulation studies (Section~\ref{sec:simulations}).
+$$
+
+# figure 3 - cartoon
+```{r}
+sim_A <- simulate_scenario_A_CORRECT(seed=1)
+
+# =========================
+# Packages
+# =========================
+suppressPackageStartupMessages({
+  library(ggplot2)
+  library(dplyr)
+  library(tidyr)
+  library(patchwork)
+})
+
+# =========================
+# Helpers
+# =========================
+prep_taxon_df <- function(sim) {
+  tibble(
+    taxon = seq_along(sim$pi_G1),
+    pi_G1 = sim$pi_G1,
+    pi_G2 = sim$pi_G2,
+    pi_ref = sim$pi_ref,
+    phi_j = sim$phi_j,
+    status = case_when(
+      taxon %in% sim$up_idx ~ "Up",
+      taxon %in% sim$down_idx ~ "Down",
+      TRUE ~ "Null"
+    )
+  ) %>%
+    mutate(
+      log_pi_ref = log(pi_ref + 1e-12),
+      log_phi = log(phi_j + 1e-12)
+    )
+}
+
+# =========================
+# A1: Taxa-level truth (pi_G1 vs pi_G2 by taxon)
+# "Cartoon" style: show top taxa only (by abundance) to keep readable
+# =========================
+plot_A1_taxa_truth <- function(sim, top_k = 30) {
+  df <- prep_taxon_df(sim) %>%
+    arrange(desc(pi_ref)) %>%
+    slice_head(n = top_k) %>%
+    mutate(taxon = factor(taxon, levels = taxon))
+
+  df_long <- df %>%
+    select(taxon, status, pi_G1, pi_G2) %>%
+    pivot_longer(cols = c(pi_G1, pi_G2), names_to = "group", values_to = "pi") %>%
+    mutate(group = recode(group, pi_G1 = "G1", pi_G2 = "G2"))
+
+  ggplot(df_long, aes(x = taxon, y = pi, fill = group)) +
+    geom_col(position = position_dodge(width = 0.75), width = 0.7) +
+    facet_grid(. ~ status, scales = "free_x", space = "free_x") +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 0.01)) +
+    labs(
+      title = "A1  Taxa-level truth: compositional shift only",
+      x = "Taxa (top by mean abundance)", y = "Relative abundance (π)"
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(
+      axis.text.x = element_blank(),
+      panel.grid.major.x = element_blank(),
+      legend.position = "top"
+    )
+}
+
+# =========================
+# A2: Compositional constraint (sum to 1 + rescaling intuition)
+# Show stacked composition bars for each group for top taxa + "Other"
+# =========================
+plot_A2_compositional_constraint <- function(sim, top_k = 20) {
+  df <- prep_taxon_df(sim) %>%
+    arrange(desc(pi_ref)) %>%
+    mutate(rank = row_number())
+
+  make_comp <- function(pi_vec, label) {
+    top <- df %>% filter(rank <= top_k) %>% pull(taxon)
+    comp <- tibble(taxon = seq_along(pi_vec), pi = pi_vec) %>%
+      mutate(taxon2 = if_else(taxon %in% top, paste0("Taxon_", taxon), "Other")) %>%
+      group_by(taxon2) %>%
+      summarise(pi = sum(pi), .groups = "drop") %>%
+      mutate(group = label)
+    comp
+  }
+
+  comp <- bind_rows(
+    make_comp(sim$pi_G1, "G1"),
+    make_comp(sim$pi_G2, "G2")
+  )
+
+  ggplot(comp, aes(x = group, y = pi, fill = taxon2)) +
+    geom_col(width = 0.6) +
+    scale_y_continuous(labels = scales::percent_format()) +
+    guides(fill = "none") +
+    labs(
+      title = "A2  Compositional constraint: each group sums to 1",
+      x = NULL, y = "Composition"
+    ) +
+    theme_minimal(base_size = 11)
+}
+
+# =========================
+# A3: Mean–variance coupling (log(pi_ref) vs log(phi_j))
+# =========================
+plot_A3_mean_variance_coupling <- function(sim) {
+  df <- prep_taxon_df(sim)
+
+  ggplot(df, aes(x = log_pi_ref, y = log_phi)) +
+    geom_point(aes(shape = status), alpha = 0.7, size = 2) +
+    geom_smooth(method = "lm", se = FALSE) +
+    labs(
+      title = "A3  Hidden coupling: mean abundance ↔ precision",
+      x = "log(π_ref)", y = "log(φ_j)"
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(legend.position = "top")
+}
+
+# =========================
+# A4: Sample-level generation (cartoon-ish)
+# We can't "draw" an actual graphical model easily with ggplot,
+# but we can visualize the BB ingredients:
+#  - library sizes
+#  - p_ij variability implied by Beta params for selected taxa
+# We'll approximate p_ij variance using Beta variance formula:
+# Var(p) = αβ / [(α+β)^2(α+β+1)]
+# =========================
+plot_A4_sample_level_mechanics <- function(sim, n_show_taxa = 12, seed = 1) {
+  set.seed(seed)
+  df <- prep_taxon_df(sim)
+
+  # pick a mix of taxa across status (so plot is informative)
+  pick <- c(
+    sample(sim$up_idx, 4),
+    sample(sim$down_idx, 4),
+    sample(sim$null_idx, 4)
+  )
+  pick <- pick[seq_len(min(length(pick), n_show_taxa))]
+
+  mech <- df %>%
+    filter(taxon %in% pick) %>%
+    select(taxon, status, pi_G1, pi_G2, phi_j) %>%
+    pivot_longer(cols = c(pi_G1, pi_G2), names_to = "group", values_to = "pi") %>%
+    mutate(
+      group = recode(group, pi_G1 = "G1", pi_G2 = "G2"),
+      alpha = phi_j * pi,
+      beta  = phi_j * (1 - pi),
+      var_p = (alpha * beta) / ((alpha + beta)^2 * (alpha + beta + 1)),
+      taxon = factor(paste0("Taxon_", taxon), levels = paste0("Taxon_", pick))
+    )
+
+  ggplot(mech, aes(x = taxon, y = var_p, fill = group)) +
+    geom_col(position = position_dodge(width = 0.75), width = 0.7) +
+    facet_grid(. ~ status, scales = "free_x", space = "free_x") +
+    labs(
+      title = "A4  Sample-level mechanics: implied Beta(p_ij) variance (by taxon)",
+      x = NULL, y = "Var(p_ij) implied by (π, φ)"
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      legend.position = "top"
+    )
+}
+
+# =========================
+# A5: What the analyst sees (apparent variability differences)
+# Show per-taxon across-sample variance of relative abundance in each group,
+# then compare groups (e.g., variance ratio or difference).
+# =========================
+plot_A5_apparent_variability <- function(sim, top_k = 30) {
+  counts <- sim$counts
+  group <- sim$group
+
+  relab <- counts / rowSums(counts)
+
+  # compute per-taxon variance within each group
+  var_by_group <- function(mat) apply(mat, 2, var)
+
+  v1 <- var_by_group(relab[group == "G1", , drop = FALSE])
+  v2 <- var_by_group(relab[group == "G2", , drop = FALSE])
+
+  df <- prep_taxon_df(sim) %>%
+    mutate(
+      var_G1 = v1,
+      var_G2 = v2,
+      log_var_ratio = log((var_G2 + 1e-12) / (var_G1 + 1e-12))
+    ) %>%
+    arrange(desc(pi_ref)) %>%
+    slice_head(n = top_k) %>%
+    mutate(taxon = factor(paste0("Taxon_", taxon), levels = paste0("Taxon_", taxon)))
+
+  ggplot(df, aes(x = taxon, y = log_var_ratio, shape = status)) +
+    geom_hline(yintercept = 0, linetype = 2) +
+    geom_point(size = 2, alpha = 0.8) +
+    labs(
+      title = "A5  Apparent DV signal: log variance ratio (G2 / G1) on relative abundances",
+      x = "Taxa (top by mean abundance)", y = "log( Var_G2 / Var_G1 )"
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      legend.position = "top"
+    )
+}
+
+# =========================
+# Run everything
+# =========================
+# sim_A <- simulate_scenario_A_CORRECT(seed = 1)   # you already have this
+
+pA1 <- plot_A1_taxa_truth(sim_A, top_k = 30)
+pA2 <- plot_A2_compositional_constraint(sim_A, top_k = 20)
+pA3 <- plot_A3_mean_variance_coupling(sim_A)
+pA4 <- plot_A4_sample_level_mechanics(sim_A, n_show_taxa = 12, seed = 1)
+pA5 <- plot_A5_apparent_variability(sim_A, top_k = 30)
+
+# Combine as a multi-panel "cartoon"
+(pA1 / pA2 / (pA3 | pA4) / pA5) +
+  plot_annotation(title = "Scenario A: Cartoon of the simulation process")
+
+# Save if you want
+# ggsave("scenario_A_cartoon.png", width = 12, height = 14, dpi = 300)
+
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tibble)
+library(ggforce)   # 用来画圆
+
+
+set.seed(1)
+
+n_taxa <- 30
+
+taxa_df <- tibble(
+  taxon = 1:n_taxa,
+  status = sample(
+    c("up", "null", "down"),
+    size = n_taxa,
+    replace = TRUE,
+    prob = c(0.3, 0.4, 0.3)
+  )
+)
+
+# Group 1: 随机均匀分布在圆内
+taxa_G1 <- taxa_df %>%
+  mutate(
+    x = rnorm(n_taxa, 0, 0.35),
+    y = rnorm(n_taxa, 0, 0.35),
+    group = "G1"
+  )
+
+# Group 2: up 往外推, down 往内收, null 不动
+taxa_G2 <- taxa_G1 %>%
+  mutate(
+    x = case_when(
+      status == "up"   ~ x * 1.4,
+      status == "down" ~ x * 0.6,
+      TRUE             ~ x
+    ),
+    y = case_when(
+      status == "up"   ~ y * 1.4,
+      status == "down" ~ y * 0.6,
+      TRUE             ~ y
+    ),
+    group = "G2"
+  )
+
+taxa_all <- bind_rows(taxa_G1, taxa_G2) %>%
+  mutate(
+    # 平移两个 group 的圆心
+    x = ifelse(group == "G1", x - 2.5, x + 2.5)
+  )
+
+ggplot() +
+
+  # ---- 大圆：Group 1 / Group 2 ----
+  geom_circle(
+    aes(x0 = -2.5, y0 = 0, r = 1.1),
+    fill = NA, color = "black", linewidth = 1
+  ) +
+  geom_circle(
+    aes(x0 =  2.5, y0 = 0, r = 1.1),
+    fill = NA, color = "black", linewidth = 1
+  ) +
+
+  # ---- taxa 点 ----
+  geom_point(
+    data = taxa_all,
+    aes(x = x, y = y, color = status),
+    size = 3
+  ) +
+
+  # ---- 中间箭头 ----
+  annotate(
+    "segment",
+    x = -1.2, xend = 1.2,
+    y = 0,   yend = 0,
+    arrow = arrow(length = unit(0.3, "cm")),
+    linewidth = 1
+  ) +
+  annotate(
+    "text",
+    x = 0, y = -0.3,
+    label = "randomly selected",
+    size = 4
+  ) +
+
+  # ---- 组标签 ----
+  annotate("text", x = -2.5, y = 1.3, label = "Group 1", size = 5) +
+  annotate("text", x =  2.5, y = 1.3, label = "Group 2", size = 5) +
+
+  # ---- 图例说明（和你手写的一样）----
+  annotate("text", x = 0, y = 1.8, label = "green: up in group 2",  color = "darkgreen", size = 4) +
+  annotate("text", x = 0, y = 1.5, label = "orange: null in group 2", color = "orange3",  size = 4) +
+  annotate("text", x = 0, y = 1.2, label = "red: down in group 2",   color = "red3",     size = 4) +
+
+  # ---- 颜色 ----
+  scale_color_manual(
+    values = c(
+      up   = "darkgreen",
+      null = "orange3",
+      down = "red3"
+    )
+  ) +
+
+  coord_fixed() +
+  theme_void() +
+  theme(legend.position = "none")
+
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tibble)
+library(ggforce)
+
+set.seed(1)
+
+# -------------------------
+# 1) 设定三类点在 Group 1 的数量（你可以改）
+# -------------------------
+n_up1   <- 10
+n_null1 <- 10
+n_down1 <- 10
+
+# Group 2: 用“点数”表达相对丰度变化（你可以改 fold）
+fold_up   <- 1.5   # up 点变多
+fold_down <- 0.5   # down 点变少
+
+n_up2   <- round(n_up1   * fold_up)
+n_null2 <- n_null1
+n_down2 <- max(1, round(n_down1 * fold_down))
+
+# -------------------------
+# 2) 在圆内生成点的函数
+#    （用 polar + sqrt 保证在圆内均匀）
+# -------------------------
+sample_points_in_circle <- function(n, r = 1.0, center_x = 0, center_y = 0) {
+  theta <- runif(n, 0, 2*pi)
+  rad   <- r * sqrt(runif(n, 0, 1))
+  tibble(
+    x = center_x + rad * cos(theta),
+    y = center_y + rad * sin(theta)
+  )
+}
+
+# -------------------------
+# 3) 生成两组点：Group 1 / Group 2
+# -------------------------
+# 圆心位置
+cx1 <- -2.5
+cx2 <-  2.5
+cy  <-  0
+
+# Group 1 points
+g1 <- bind_rows(
+  sample_points_in_circle(n_up1,   r = 0.95, center_x = cx1, center_y = cy) %>% mutate(status = "up"),
+  sample_points_in_circle(n_null1, r = 0.95, center_x = cx1, center_y = cy) %>% mutate(status = "null"),
+  sample_points_in_circle(n_down1, r = 0.95, center_x = cx1, center_y = cy) %>% mutate(status = "down")
+) %>% mutate(group = "G1")
+
+# Group 2 points (numbers changed!)
+g2 <- bind_rows(
+  sample_points_in_circle(n_up2,   r = 0.95, center_x = cx2, center_y = cy) %>% mutate(status = "up"),
+  sample_points_in_circle(n_null2, r = 0.95, center_x = cx2, center_y = cy) %>% mutate(status = "null"),
+  sample_points_in_circle(n_down2, r = 0.95, center_x = cx2, center_y = cy) %>% mutate(status = "down")
+) %>% mutate(group = "G2")
+
+pts <- bind_rows(g1, g2)
+
+# -------------------------
+# 4) 画图：两圆 + 点数变化 + 箭头 + 图例文字
+# -------------------------
+ggplot() +
+  geom_circle(aes(x0 = cx1, y0 = cy, r = 1.1), fill = NA, color = "black", linewidth = 1) +
+  geom_circle(aes(x0 = cx2, y0 = cy, r = 1.1), fill = NA, color = "black", linewidth = 1) +
+  geom_point(data = pts, aes(x = x, y = y, color = status), size = 3) +
+
+  annotate(
+    "segment",
+    x = cx1 + 1.25, xend = cx2 - 1.25, y = cy, yend = cy,
+    arrow = arrow(length = unit(0.3, "cm")),
+    linewidth = 1
+  ) +
+  annotate("text", x = 0, y = -0.35, label = "randomly selected", size = 4) +
+
+  annotate("text", x = cx1, y = 1.35, label = "Group 1", size = 5) +
+  annotate("text", x = cx2, y = 1.35, label = "Group 2", size = 5) +
+
+  annotate("text", x = 0, y = 1.85, label = "green: increase relative abundance in group 2",    color = "darkgreen", size = 4) +
+  annotate("text", x = 0, y = 1.55, label = "orange: unchanged in group 2",  color = "orange3",  size = 4) +
+  annotate("text", x = 0, y = 1.25, label = "red: decrease relative abundance in group 2",     color = "red3",     size = 4) +
+
+  scale_color_manual(values = c(up = "darkgreen", null = "orange3", down = "red3")) +
+  coord_fixed(xlim = c(-4.2, 4.2), ylim = c(-2.2, 2.2)) +
+  theme_void() +
+  theme(legend.position = "none")
+
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tibble)
+library(ggforce)
+
+set.seed(1)
+
+# -------------------------
+# 1) Group 1: 三类点数（总量固定）
+# -------------------------
+n_up1   <- 10
+n_null1 <- 10
+n_down1 <- 10
+
+N_total <- n_up1 + n_null1 + n_down1
+
+# Group 2: "relative abundance redistribution"
+# up 增加多少点，就从 down 里挪同样数量的点（保证总点数不变）
+delta_up <- 5  # 你可以改：up 增加的“点数”
+n_up2   <- n_up1 + delta_up
+n_null2 <- n_null1
+n_down2 <- n_down1 - delta_up
+stopifnot(n_down2 > 0)   # 防止 down 变成 0 或负数
+stopifnot(n_up2 + n_null2 + n_down2 == N_total)
+
+# -------------------------
+# 2) 在圆内生成点
+# -------------------------
+sample_points_in_circle <- function(n, r = 1.0, center_x = 0, center_y = 0) {
+  theta <- runif(n, 0, 2*pi)
+  rad   <- r * sqrt(runif(n, 0, 1))
+  tibble(
+    x = center_x + rad * cos(theta),
+    y = center_y + rad * sin(theta)
+  )
+}
+
+# -------------------------
+# 3) 生成两组点：Group 1 / Group 2
+# -------------------------
+cx1 <- -2.5
+cx2 <-  2.5
+cy  <-  0
+
+g1 <- bind_rows(
+  sample_points_in_circle(n_up1,   r = 0.95, center_x = cx1, center_y = cy) %>% mutate(status = "up"),
+  sample_points_in_circle(n_null1, r = 0.95, center_x = cx1, center_y = cy) %>% mutate(status = "null"),
+  sample_points_in_circle(n_down1, r = 0.95, center_x = cx1, center_y = cy) %>% mutate(status = "down")
+) %>% mutate(group = "G1")
+
+g2 <- bind_rows(
+  sample_points_in_circle(n_up2,   r = 0.95, center_x = cx2, center_y = cy) %>% mutate(status = "up"),
+  sample_points_in_circle(n_null2, r = 0.95, center_x = cx2, center_y = cy) %>% mutate(status = "null"),
+  sample_points_in_circle(n_down2, r = 0.95, center_x = cx2, center_y = cy) %>% mutate(status = "down")
+) %>% mutate(group = "G2")
+
+pts <- bind_rows(g1, g2)
+
+# -------------------------
+# 4) 画图：两圆 + 点（形状+颜色）+ 箭头 + 图例文字
+# -------------------------
+ggplot() +
+  geom_circle(aes(x0 = cx1, y0 = cy, r = 1.1), fill = NA, color = "black", linewidth = 1) +
+  geom_circle(aes(x0 = cx2, y0 = cy, r = 1.1), fill = NA, color = "black", linewidth = 1) +
+
+  geom_point(
+    data = pts,
+    aes(x = x, y = y, color = status, shape = status),
+    size = 3
+  ) +
+
+  annotate(
+    "segment",
+    x = cx1 + 1.25, xend = cx2 - 1.25,
+    y = cy, yend = cy,
+    arrow = arrow(length = unit(0.3, "cm")),
+    linewidth = 1
+  ) +
+  annotate("text", x = 0, y = -0.35, label = "randomly selected", size = 4) +
+
+  annotate("text", x = cx1, y = 1.35, label = "Group 1", size = 5) +
+  annotate("text", x = cx2, y = 1.35, label = "Group 2", size = 5) +
+
+  # --- 更干净的 legend 文本（方案 A：最简洁）---
+  annotate("text", x = 0, y = 1.85, label = "\u25B2  Up (G2 > G1)",   color = "darkgreen", size = 4) +
+  annotate("text", x = 0, y = 1.55, label = "\u25CF  Null",          color = "orange3",   size = 4) +
+  annotate("text", x = 0, y = 1.25, label = "\u25A0  Down (G2 < G1)", color = "red3",      size = 4) +
+
+  scale_color_manual(values = c(up = "darkgreen", null = "orange3", down = "red3")) +
+  scale_shape_manual(values = c(up = 17, null = 16, down = 15)) +  # ▲ ● ■
+  coord_fixed(xlim = c(-4.2, 4.2), ylim = c(-2.2, 2.2)) +
+  theme_void() +
+  theme(legend.position = "none")
+
+```
+
+# simulator 1
+```{r}
+# ============================================================================
+# Scenario: No DC, No DV using simulate_compositional_bb
+# ============================================================================
+
+# Parameters
+n_taxa <- 200
+n_samples_per_group <- 150
+n_samples <- n_samples_per_group * 2
+
+# Step 1: Create baseline abundances (shared across groups)
+set.seed(42)
+mu_inv_softmax <- rnorm(n_taxa, mean = 0, sd = 2)
+mu_inv_softmax <- mu_inv_softmax - mean(mu_inv_softmax)  # Sum to 0 constraint
+
+# Step 2: No DC - all slopes = 0
+slope_vector <- rep(0, n_taxa)
+# Verify sum to 0
+stopifnot(abs(sum(slope_vector)) < 1e-10)
+
+# Step 3: Mean-variance entanglement parameters
+# Test both with and without entanglement
+
+# Option A: No entanglement (TRUE NULL)
+log_dispersion_assoc_no_entangle <- 0
+
+# Option B: With entanglement (like your simulator)
+log_dispersion_assoc_with_entangle <- -0.74
+
+# Step 4: Other parameters
+sd_log_overdispersion <- 0.3
+intercept_dispersion <- log(25.37)  # Your gamma0
+
+# Library sizes
+library_size_mean <- 15000
+library_size_sd <- sqrt(15000/3)
+
+# Step 5: Create design matrix for two groups
+design_matrix <- cbind(
+  Intercept = 1,
+  Group = rep(c(1, -1), each = n_samples_per_group)  # Contrast coding
+)
+# Simulation A: No entanglement (slope = 0)
+
+sim_stefano_no_entangle <- simulate_compositional_bb(
+  slope_vector = slope_vector,
+  mu_inv_softmax = mu_inv_softmax,
+  log_dispersion_assoc = log_dispersion_assoc_no_entangle,  # 0
+  n_taxa = n_taxa,
+  n_samples = n_samples,
+  sd_log_overdispersion = sd_log_overdispersion,
+  intercept_dispersion = intercept_dispersion,
+  library_size_mean = library_size_mean,
+  library_size_sd = library_size_sd,
+  design_matrix = design_matrix,
+  seed = 42
+)
+
+
+# Step 1: Prepare data for sccomp
+sccomp_data <- sim_stefano_no_entangle$count_long %>%
+  select(sample_id, taxon_id, group, count) %>%
+  rename(
+    sample = sample_id,
+    cell_group = taxon_id
+  )%>%
+  mutate(count = as.integer(count))
+
+
+sccomp_res <- sccomp_estimate(
+  .data = sccomp_data,
+  formula_composition = ~ 1 + group,
+  formula_variability = ~ 1 + group,
+  sample = "sample",
+  cell_group = "cell_group",
+  abundance = "count",
+  inference_method = "hmc",
+  verbose = FALSE
+)
+
+sccomp_test_alt <- sccomp_test(sccomp_res)
+
+# Plot
+plot(sccomp_test_alt)
+```
+
+```{r, fig.width=14, fig.height=9, dpi=300, out.width="100%"}
+# Plot
+plot(sccomp_test_alt)
+```
+

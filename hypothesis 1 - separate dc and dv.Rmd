@@ -1,0 +1,345 @@
+---
+title: "hypothesis 1 - signal of dc and dv"
+author: "Lejing Li"
+date: "2025-11-29"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+# package
+```{r}
+devtools::load_all()
+```
+
+```{r}
+library(sccomp)
+packageVersion("sccomp")
+```
+
+```{r}
+library(corncob)
+library(magrittr)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(patchwork)
+library(ggplot2)
+library(ggrepel)
+library(posterior)
+library(purrr)
+library(stringr)
+library(readr)
+library(phyloseq)
+library(ggplot2)
+library(patchwork)
+library(vegan)
+library(tidyverse)
+library(compositions)
+library(VGAM)
+```
+
+# Simulation
+Simulation Pipeline
+
+1 Generate baseline mean parameters (α) and baseline dispersion parameters (γ) for K = 80 taxa.
+
+2 Partition the 80 taxa into four categories:
+
+    null
+    DC-only
+    DV-only
+    both DC and DV
+
+3 Generate β (differential composition effect) for taxa in the DC-only and both categories.
+
+4 Generate δ (differential variability effect) for taxa in the DV-only and both categories.
+
+5 Define group-specific parameters:
+
+    Group 1: mean = α, dispersion = γ
+    Group 2: mean = α + β, dispersion = γ + δ
+
+6 Convert parameters to interpretable scales:
+
+    mean = logistic(·)
+    dispersion = exp(·)
+
+7 Generate observed counts using a beta–binomial model with sample-specific library sizes.
+
+8 Combine results into a 80 × 80 count matrix (80 samples × 80 taxa).
+
+
+OBJECTIVE: Test the hypothesis that sccomp can separate differential composition (DC) and differential variability (DV) signals, while corncob cannot.
+
+We simulated microbiome count data using a beta-binomial model, which is the standard choice for compositional count data with overdispersion. This is the same model used by corncob and sccomp.
+
+We generated data for 80 taxa across 80 samples (40 per group). Each taxon has a baseline mean abundance and baseline overdispersion parameter φ (ranging from 0.14 to 2.7, representing low to high variability). Library sizes varied by about 35% around a mean of 10,000 reads, mimicking realistic sequencing experiments.
+
+The key feature of our simulation is that DC and DV effects are truly independent. We partitioned taxa into four groups: (1) 32 null taxa with no changes, (2) 16 taxa with composition changes only (DC), (3) 16 taxa with variability changes only (DV), and (4) 16 taxa with both DC and DV that change independently. Effect sizes ranged from small to large (±0.5 to ±1.5 on logit/log scale), with random directions.
+
+```{r}
+set.seed(123)
+K <- 200           # num of taxa 
+n_per_group <- 150 # sample size in each group
+sd_lib <- 0.3      # library size log-scale sd
+
+# baseline distribution
+draw_alpha <- function(K) runif(K, -6, -1)  # logit mean
+draw_gamma <- function(K) runif(K, -2, 1)   # log dispersion
+
+# effect - modified to use effect_size parameter
+draw_effect <- function(effect_size = 2) {
+  sign <- sample(c(-1, 1), 1)
+  magnitude <- runif(1, 0.5 * effect_size, 1.5 * effect_size)
+  sign * magnitude
+}
+
+# Beta-binomial sampled，phi = overdispersion
+# Modified to use c0 concentration parameter
+rBB <- function(n, size, prob, c0 = 60) {
+  # Convert c0 to phi (overdispersion)
+  # c0 = 1/phi, so phi = 1/c0
+  phi <- 1 / c0
+  rho <- 1 / (1 + phi)
+  VGAM::rbetabinom.ab(
+    n = n,
+    size = size,
+    shape1 = prob * (1 - rho) / rho,
+    shape2 = (1 - prob) * (1 - rho) / rho
+  )
+}
+
+```
+
+
+
+# Independent DC and DV
+```{r}
+generate_params_independent <- function(effect_size = 2, prop_differential = 0.5) {
+  alpha <- draw_alpha(K)
+  gamma <- draw_gamma(K)
+  
+  # Calculate number of differential taxa based on proportion
+  n_differential <- round(K * prop_differential)
+  # Split differential taxa into 3 equal groups: DC-only, DV-only, both
+  n_per_category <- round(n_differential / 3)
+  
+  # 4 types of taxa
+  n_null <- K - 3 * n_per_category
+  idx_null <- 1:n_null
+  idx_dc   <- (n_null + 1):(n_null + n_per_category)
+  idx_dv   <- (n_null + n_per_category + 1):(n_null + 2 * n_per_category)
+  idx_both <- (n_null + 2 * n_per_category + 1):K
+  
+  beta  <- rep(0, K)
+  delta <- rep(0, K)
+  
+  beta[idx_dc] <- replicate(length(idx_dc), draw_effect(effect_size))
+  delta[idx_dv] <- replicate(length(idx_dv), draw_effect(effect_size))
+  beta[idx_both]  <- replicate(length(idx_both), draw_effect(effect_size))
+  delta[idx_both] <- replicate(length(idx_both), draw_effect(effect_size))
+  
+  tibble(taxa = paste0("taxon", 1:K), alpha, beta, gamma, delta)
+}
+
+simulate_scenario <- function(param_tbl,
+                              c0 = 60, 
+                              libsize_mean = 15000, 
+                              libsize_dispersion = 5) {
+  n_samples <- 2 * n_per_group
+  sample_ids <- paste0("S", seq_len(n_samples))
+  
+  Day <- factor(
+    c(rep("Day1", n_per_group), rep("Day2", n_per_group)),
+    levels = c("Day1", "Day2")
+  )
+  
+  sample_data <- tibble(sample = sample_ids, Day = Day)
+  rownames(sample_data) <- sample_data$sample
+  
+  # Modified library size generation using gamma distribution
+  # Mean = shape/rate, Variance = shape/rate^2
+  # CV = 1/sqrt(shape) = libsize_dispersion
+  # So shape = 1/libsize_dispersion^2
+  shape <- 1 / (libsize_dispersion^2)
+  rate <- shape / libsize_mean
+  N <- rgamma(n_samples, shape = shape, rate = rate) |> round()
+  
+  g <- ifelse(Day == "Day2", 1, 0)
+  
+  counts_mat <- matrix(0L, nrow = n_samples, ncol = K)
+  rownames(counts_mat) <- sample_ids
+  colnames(counts_mat) <- param_tbl$taxa
+  
+  for (i in seq_len(n_samples)) {
+    for (j in seq_len(K)) {
+      prob <- plogis(param_tbl$alpha[j] + param_tbl$beta[j] * g[i])
+      # Use c0 directly instead of computing from gamma/delta
+      counts_mat[i, j] <- rBB(n = 1, size = N[i], prob = prob, c0 = c0)
+    }
+  }
+  
+  list(
+    counts = counts_mat,
+    sample_data = sample_data
+  )
+}
+```
+
+# corncob
+
+```{r}
+run_corncob_analysis <- function(scenario) {
+  
+  counts <- scenario$counts
+  sample_data <- scenario$sample_data
+  data <- t(counts)
+  
+  result_corncob <- differentialTest(
+    formula = ~ Day,
+    phi.formula = ~ Day,
+    formula_null = ~ 1,
+    phi.formula_null = ~ 1,
+    data = data,
+    taxa_are_rows = TRUE,
+    sample_data = sample_data,
+    test = "Wald",
+    boot = FALSE,
+    fdr_cutoff = 1  # Get all taxa
+  )
+  
+  # Extract effects from ALL significant models
+  n_models <- length(result_corncob$significant_models)
+  if (n_models == 0) return(list(cor = NA, n_sig = 0))
+  
+  dc_effects <- numeric(n_models)
+  dv_effects <- numeric(n_models)
+  
+  for (i in 1:n_models) {
+    coef_matrix <- result_corncob$significant_models[[i]]$coefficients
+    mu_row <- grep("mu.*Day", rownames(coef_matrix), value = TRUE)
+    phi_row <- grep("phi.*Day", rownames(coef_matrix), value = TRUE)
+    
+    dc_effects[i] <- ifelse(length(mu_row) > 0, coef_matrix[mu_row, "Estimate"], NA)
+    dv_effects[i] <- ifelse(length(phi_row) > 0, coef_matrix[phi_row, "Estimate"], NA)
+  }
+  
+  # Calculate correlation using Spearman
+  valid_idx <- !is.na(dc_effects) & !is.na(dv_effects)
+  cor_val <- if(sum(valid_idx) > 1) {
+    cor(dc_effects[valid_idx], dv_effects[valid_idx], method = "spearman") 
+  } else {
+    NA
+  }
+  
+  return(list(
+    cor = cor_val,
+    n_sig = n_models
+  ))
+}
+
+```
+
+
+
+
+# result
+
+
+```{r}
+n_sim <- 50
+results_list <- list()
+
+pb2 <- txtProgressBar(min = 0, max = n_sim, style = 3)
+
+corncob_results <- list()
+
+for (i in 1:n_sim) {
+  set.seed(100 + i)
+  
+  params <- generate_params_independent()
+  scenario <- simulate_scenario(params)
+  
+  suppressMessages({
+    res_corncob <- run_corncob_analysis(scenario)
+  })
+  
+  corncob_results[[i]] <- tibble(
+    sim = i,
+    corncob_cor = res_corncob$cor,
+    corncob_n_sig = res_corncob$n_sig
+  )
+  
+  setTxtProgressBar(pb2, i)
+}
+
+close(pb2)
+
+corncob_df <- bind_rows(corncob_results)
+save(corncob_results, corncob_df, file="corncob_result.RData")
+```
+
+
+```{r}
+corncob_df %>%
+  summarise(
+    mean = mean(abs(corncob_cor), na.rm = TRUE),
+    median = median(abs(corncob_cor), na.rm = TRUE),
+    sd = sd(abs(corncob_cor), na.rm = TRUE),
+    min = min(abs(corncob_cor), na.rm = TRUE),
+    max = max(abs(corncob_cor), na.rm = TRUE),
+    q25 = quantile(abs(corncob_cor), 0.25, na.rm = TRUE),
+    q75 = quantile(abs(corncob_cor), 0.75, na.rm = TRUE)
+  )
+```
+
+
+
+
+```{r, fig.width=14, fig.height=9, dpi=300, out.width="100%"}
+plot(result_tested)
+```
+
+
+
+
+# single test for sccomp
+```{r}
+params <- generate_params_independent()
+scenario <- simulate_scenario(params)
+
+counts <- scenario$counts
+sample_data <- scenario$sample_data
+  
+sccomp_input <- counts %>%
+      as.data.frame() %>%
+      rownames_to_column("sample") %>%
+      pivot_longer(-sample, names_to = "cell_group", values_to = "count") %>%
+      mutate(count = as.integer(count)) %>%
+      left_join(sample_data, by = "sample")
+    
+
+result <- sccomp_estimate(
+        .data = sccomp_input,
+        formula_composition = ~ 1 + Day,
+        formula_variability = ~ 1 + Day,
+        sample = "sample",
+        cell_group = "cell_group",
+        abundance = "count",
+        inference_method = "hmc",
+        enable_loo = FALSE
+      )
+      
+result_tested <- sccomp_test(result)
+plot(result_tested)
+save(result, result_tested,
+     file = "h1.RData")
+```
+
+```{r, fig.width=14, fig.height=9, dpi=300, out.width="100%"}
+plot(result_tested)
+```
